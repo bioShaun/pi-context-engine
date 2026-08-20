@@ -1,0 +1,23 @@
+{
+  "name": "pi-context-engine",
+  "version": "0.1.0",
+  "description": "Context lifecycle engine for Pi Coding Agent: metrics, safe pruning, structured checkpoints, pressure policy, pins, and handoff suggestions.",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
