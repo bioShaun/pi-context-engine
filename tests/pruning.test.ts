@@ -160,3 +160,27 @@ test("user and assistant messages are never modified", () => {
   assert.equal(result.context[3], msgs[3]);
   assert.equal(result.context[1], msgs[1]);
 });
+
+test("fold path is idempotent: a folded result is never re-folded", () => {
+  const id = "fold1";
+  const msgs: AnyMessage[] = [
+    assistantToolCall("bash", { command: "seq 1 3000" }, id),
+    toolResult("bash", bigText(400, "seq"), { id }),
+  ];
+  const { analysis: a1 } = analyze(msgs);
+  const first = pruneContext({ messages: msgs, analysis: a1, toolCalls: buildToolCalls(msgs), opts: MANUAL_PRUNE_OPTS });
+  const folded = first.actions.find((a) => a.kind === "fold");
+  assert.ok(folded, "first pass folds the oversized result");
+  const afterFirst = (first.context[1].details as Record<string, unknown>).kind;
+  assert.equal(afterFirst, "fold");
+
+  const { analysis: a2 } = analyze(first.context);
+  const second = pruneContext({
+    messages: first.context,
+    analysis: a2,
+    toolCalls: buildToolCalls(first.context),
+    opts: MANUAL_PRUNE_OPTS,
+  });
+  assert.equal(second.actions.length, 0, "second pass makes no changes");
+  assert.equal(second.context[1], first.context[1], "folded message untouched");
+});

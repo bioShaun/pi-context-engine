@@ -7,6 +7,7 @@ export type BashCategory =
   | "build" // build, compile, download-heavy
   | "fetch" // wget / curl download
   | "test" // pytest, jest, go test, ...
+  | "gitdiff" // git diff (full diff — working set, spec §11)
   | "trivial" // ls, pwd, cd, echo, git status, ...
   | "normal";
 
@@ -24,6 +25,8 @@ const TEST_RE =
 const TRIVIAL_RE =
   /^(?:ls|ll|pwd|cd|echo|which|whoami|date|true|clear)\b/;
 const GIT_TRIVIAL_RE = /^git\s+(?:status|st|branch|log\s+--oneline|diff\s+--stat|show\s+--stat|remote\s+-v|rev-parse)\b/;
+/** Full `git diff` (no --stat): current-diff is working set (spec §11). */
+const GIT_DIFF_RE = /^git\s+diff\b(?!\s+--stat)/;
 
 export function categorizeCommand(command: string): BashCategory {
   if (!command) return "normal";
@@ -34,6 +37,7 @@ export function categorizeCommand(command: string): BashCategory {
   if (TEST_RE.test(cmd)) return "test";
   if (BUILD_RE.test(cmd)) return "build";
   if (FETCH_RE.test(cmd)) return "fetch";
+  if (GIT_DIFF_RE.test(cmd)) return "gitdiff";
   if (TRIVIAL_RE.test(cmd) || GIT_TRIVIAL_RE.test(cmd)) return "trivial";
   return "normal";
 }

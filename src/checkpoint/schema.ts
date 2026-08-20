@@ -19,7 +19,25 @@ function strArray(v: unknown, field: string, errors: string[]): string[] {
     errors.push(`${field} must be an array`);
     return [];
   }
-  return v.filter((x): x is string => isStr(x));
+  const out: string[] = [];
+  for (let i = 0; i < v.length; i++) {
+    const x = v[i];
+    if (!isStr(x)) {
+      errors.push(`${field}[${i}] must be a string`);
+      continue;
+    }
+    out.push(x);
+  }
+  return out;
+}
+
+function enumValue(v: unknown, allowed: string[], field: string, errors: string[]): string {
+  if (v === undefined) return allowed[0]; // absent optional → default
+  if (!isStr(v) || !allowed.includes(v)) {
+    errors.push(`${field} must be one of ${allowed.join(" | ")}`);
+    return allowed[0];
+  }
+  return v;
 }
 
 function decisionArray(v: unknown, field: string, errors: string[]): CheckpointDecision[] {
@@ -28,14 +46,24 @@ function decisionArray(v: unknown, field: string, errors: string[]): CheckpointD
     return [];
   }
   const out: CheckpointDecision[] = [];
-  for (const d of v) {
-    if (!d || typeof d !== "object") continue;
+  for (let i = 0; i < v.length; i++) {
+    const d = v[i];
+    if (!d || typeof d !== "object" || Array.isArray(d)) {
+      errors.push(`${field}[${i}] must be an object`);
+      continue;
+    }
     const o = d as Record<string, unknown>;
-    if (!isStr(o.decision) || !o.decision.trim()) continue;
+    if (!isStr(o.decision) || !o.decision.trim()) {
+      errors.push(`${field}[${i}].decision must be a non-empty string`);
+      continue;
+    }
+    if (o.reason !== undefined && !isStr(o.reason)) {
+      errors.push(`${field}[${i}].reason must be a string`);
+    }
     out.push({
       decision: o.decision.trim(),
       reason: isStr(o.reason) ? o.reason : "",
-      status: o.status === "superseded" || o.status === "abandoned" ? o.status : "active",
+      status: enumValue(o.status, ["active", "superseded", "abandoned"], `${field}[${i}].status`, errors) as CheckpointDecision["status"],
     });
   }
   return out;
@@ -52,9 +80,23 @@ export function validateCheckpoint(raw: unknown): ValidationResult {
   }
   const o = raw as Record<string, unknown>;
 
-  const task = (o.task ?? {}) as Record<string, unknown>;
+  if (o.version !== undefined && o.version !== 1) {
+    errors.push(`unsupported version ${JSON.stringify(o.version)} (expected 1)`);
+  }
+
+  if (o.created_at !== undefined && (!isStr(o.created_at) || Number.isNaN(Date.parse(o.created_at)))) {
+    errors.push("created_at must be an ISO-8601 timestamp string");
+  }
+
+  const taskRaw = o.task;
+  if (!taskRaw || typeof taskRaw !== "object" || Array.isArray(taskRaw)) {
+    errors.push("task must be an object");
+  }
+  const task = (taskRaw ?? {}) as Record<string, unknown>;
   const goal = isStr(task.goal) ? task.goal.trim() : "";
   if (!goal) errors.push("task.goal is required and must be a non-empty string");
+  if (task.phase !== undefined && !isStr(task.phase)) errors.push("task.phase must be a string");
+  const taskStatus = enumValue(task.status, ["in_progress", "blocked", "done"], "task.status", errors);
 
   const files = (o.files ?? {}) as Record<string, unknown>;
   const verification = (o.verification ?? {}) as Record<string, unknown>;
@@ -64,12 +106,21 @@ export function validateCheckpoint(raw: unknown): ValidationResult {
 
   type Issue = { description: string; status: "open" | "resolved" | "blocked" };
   const issues: Issue[] = [];
-  for (const it of issuesRaw) {
-    const r = (it ?? {}) as Record<string, unknown>;
-    if (!isStr(r.description) || !r.description.trim()) continue;
-    const status: Issue["status"] =
-      r.status === "resolved" || r.status === "blocked" ? (r.status as Issue["status"]) : "open";
-    issues.push({ description: r.description.trim(), status });
+  for (let i = 0; i < issuesRaw.length; i++) {
+    const it = issuesRaw[i];
+    if (!it || typeof it !== "object" || Array.isArray(it)) {
+      errors.push(`issues[${i}] must be an object`);
+      continue;
+    }
+    const r = it as Record<string, unknown>;
+    if (!isStr(r.description) || !r.description.trim()) {
+      errors.push(`issues[${i}].description must be a non-empty string`);
+      continue;
+    }
+    issues.push({
+      description: r.description.trim(),
+      status: enumValue(r.status, ["open", "resolved", "blocked"], `issues[${i}].status`, errors) as Issue["status"],
+    });
   }
 
   const checkpoint: Checkpoint = {
@@ -77,8 +128,8 @@ export function validateCheckpoint(raw: unknown): ValidationResult {
     created_at: isStr(o.created_at) ? o.created_at : new Date().toISOString(),
     task: {
       goal,
-      phase: isStr(task.phase) ? task.phase : "in_progress",
-      status: isStr(task.status) ? task.status : "in_progress",
+      phase: isStr(task.phase) && task.phase.trim() ? task.phase.trim() : "in_progress",
+      status: taskStatus,
     },
     requirements: strArray(o.requirements, "requirements", errors),
     constraints: strArray(o.constraints, "constraints", errors),

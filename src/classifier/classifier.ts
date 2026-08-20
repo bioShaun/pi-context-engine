@@ -295,6 +295,25 @@ function classifyToolish(
       // unknown outcome → treat like a normal command below
     }
 
+    if (cat === "gitdiff") {
+      // Current diff is working set (spec §11): latest stays, superseded → stale.
+      if (isSuperseded) {
+        return makeItem(
+          msg, i, messages, "stale", 20,
+          [...tags, "old-diff"],
+          { reason: "superseded by a later git diff", supersededBy: groupLast },
+          estimate,
+        );
+      }
+      return makeItem(
+        msg, i, messages, "working",
+        scoreImportance(tokens >= opts.oversizedTokens ? 75 : 85),
+        [...tags, "active-diff", ...(tokens >= opts.oversizedTokens ? ["oversized"] : [])],
+        { reason: "current git diff (working set)" },
+        estimate,
+      );
+    }
+
     if (cat === "trivial") {
       if (!err) {
         return makeItem(
@@ -347,11 +366,21 @@ function classifyToolish(
         estimate,
       );
     }
+    // Precision > recall (§51): an older *small* command output may still be
+    // referenced — keep it. Only oversized old output is stub-eligible.
+    if (tokens < opts.oversizedTokens) {
+      return makeItem(
+        msg, i, messages, "working", 35,
+        [...tags, "old-output"],
+        { reason: "older successful command output (small — kept)" },
+        estimate,
+      );
+    }
     return makeItem(
       msg, i, messages, "stale",
-      scoreImportance(tokens >= opts.oversizedTokens ? 20 : 25),
-      [...tags, "old-output", ...(tokens >= opts.oversizedTokens ? ["oversized"] : [])],
-      { reason: "older successful command output" },
+      scoreImportance(20),
+      [...tags, "old-output", "oversized"],
+      { reason: "older oversized command output" },
       estimate,
     );
   }

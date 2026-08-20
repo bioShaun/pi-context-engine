@@ -142,3 +142,53 @@ test("compaction summary is critical", () => {
   assert.equal(it.class, "critical");
   assert.ok(it.tags.includes("summary"));
 });
+
+test("git diff: latest is working active-diff, superseded is stale", () => {
+  const id1 = "gd1";
+  const id2 = "gd2";
+  const msgs: AnyMessage[] = [
+    assistantToolCall("bash", { command: "git diff" }, id1),
+    toolResult("bash", bigText(300, "+diff"), { id: id1 }),
+    assistantToolCall("bash", { command: "git diff" }, id2),
+    toolResult("bash", bigText(300, "+diff2"), { id: id2 }),
+  ];
+  const r = classifyMessages(msgs);
+  const old = r.items.find((x) => x.tags.includes("old-diff"));
+  assert.ok(old, `expected old-diff item, got ${JSON.stringify(r.items.map((i) => i.tags))}`);
+  assert.equal(old!.class, "stale");
+  const cur = r.items.find((x) => x.tags.includes("active-diff"));
+  assert.ok(cur, "expected active-diff item");
+  assert.equal(cur!.class, "working");
+  assert.ok(cur!.importance >= 75);
+});
+
+test("git diff --stat stays trivial (not active-diff)", () => {
+  const msgs: AnyMessage[] = [bashExecution("git diff --stat", "a.py | 2 +-\n")];
+  const it = classifyMessages(msgs).items[0];
+  assert.ok(it.tags.includes("trivial"));
+  assert.ok(!it.tags.includes("active-diff"));
+});
+
+test("small old normal command output is kept; oversized old is stale", () => {
+  const pair = (id: string, cmd: string, out: string) => [
+    assistantToolCall("bash", { command: cmd }, id),
+    toolResult("bash", out, { id }),
+  ];
+  const msgs: AnyMessage[] = [];
+  // 10 old pads, then the small target, then 8 fresh pads so the small
+  // target falls outside the recent window (default 8).
+  for (let i = 0; i < 10; i++) msgs.push(...pair(`old${i}`, `echo old${i}`, `old${i}\n`));
+  msgs.push(...pair("small1", "python -c 'print(1)'", "1\n"));
+  msgs.push(...pair("big1", "seq 1 3000", bigText(400, "seq")));
+  // 8 fresh pads push both targets outside the recent window (default 8).
+  for (let i = 0; i < 8; i++) msgs.push(...pair(`new${i}`, `echo new${i}`, `new${i}\n`));
+
+  const r = classifyMessages(msgs);
+  const at = (id: string) => r.items[msgs.findIndex((m) => m.toolCallId === id)];
+  const small = at("small1")!;
+  assert.equal(small.class, "working", `small old output kept, got ${small.class}: ${small.reason}`);
+  assert.ok(small.tags.includes("old-output"), `tags: ${small.tags}`);
+  const big = at("big1")!;
+  assert.equal(big.class, "stale", `oversized old output stale, got ${big.class}: ${big.reason}`);
+  assert.ok(big.tags.includes("oversized"), `tags: ${big.tags}`);
+});

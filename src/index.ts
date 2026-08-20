@@ -288,17 +288,38 @@ async function cmdStatus(ctx: ExtensionCommandContext): Promise<void> {
 
 /**
  * The `context` event already handed us the exact message list for the next
- * call; commands that run while idle fall back to the session context.
+ * call; commands that run while idle prefer that list — but ONLY while the
+ * session and leaf it was captured from are still current. Otherwise we
+ * fall back to the authoritative session context. Stale captures (session
+ * switch, /tree navigation, compaction) must never leak into a report.
  */
 let lastSeenMessages: readonly AnyMessage[] = [];
+let lastSeenSession: { id: string; leaf: string | null } | null = null;
+
+function safeLeafId(ctx: ExtensionContext): string | null {
+  try {
+    return ctx.sessionManager.getLeafId();
+  } catch {
+    return null;
+  }
+}
 
 function currentMessages(ctx: ExtensionCommandContext): AnyMessage[] {
-  if (lastSeenMessages.length) return [...lastSeenMessages];
+  const e = engine;
+  if (
+    e &&
+    lastSeenSession &&
+    lastSeenSession.id === e.sessionId &&
+    lastSeenSession.leaf === safeLeafId(ctx) &&
+    lastSeenMessages.length
+  ) {
+    return [...lastSeenMessages];
+  }
   try {
     const entries = ctx.sessionManager.buildContextEntries();
     return entries.flatMap((en) => sessionEntryToContextMessages(en)) as AnyMessage[];
   } catch {
-    return [];
+    return [...lastSeenMessages];
   }
 }
 
@@ -360,15 +381,26 @@ async function cmdCheckpoint(ctx: ExtensionCommandContext): Promise<void> {
 async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
   const e = engine;
   if (!e) return notify(ctx, "context engine not initialized", "warning");
-  const cp = loadLatestCheckpoint(e);
+  // G4 (§4): a checkpoint must exist before we compact.
+  let cp = loadLatestCheckpoint(e);
+  if (!cp || !checkpointIsFresh(e)) {
+    notify(ctx, "generating checkpoint before compact…", "info");
+    const r = await runCheckpoint(e, ctx, currentMessages(ctx), "auto", (t, k) => notify(ctx, t, k));
+    if (!r.ok) {
+      notify(ctx, `compact aborted — no recoverable checkpoint: ${r.text}`, "error");
+      return;
+    }
+    cp = loadLatestCheckpoint(e);
+  }
   notify(ctx, "compaction started (checkpoint-anchored)", "info");
   try {
     ctx.compact({
       customInstructions: compactInstructions(cp),
+      // NOTE: do NOT count compactions here. Pi emits `session_compact` for
+      // extension-triggered compactions too — the handler is the single
+      // source of truth (double-counting would corrupt the handoff gate).
       onComplete: () => {
         try {
-          e.state.compactionCount += 1;
-          persistState(e);
           e.auditor.event("compact", { triggered: "manual" });
           notify(ctx, "compaction completed", "info");
         } catch {
@@ -541,17 +573,31 @@ export default function (pi: ExtensionAPI): void {
   piApi = pi;
 
   pi.on("session_start", (_event, ctx) => {
-    engine = createEngine(ctx);
-    if (engine.config.enabled && ctx.hasUI) {
-      ctx.ui.setStatus(
-        ENGINE_ID,
-        `context-engine on (prune ${resolveThresholds(engine.config, toModelInfo(ctx.model)).prune})`,
-      );
+    // Fail-open even at startup (§36): a broken config must not block the session.
+    try {
+      engine = createEngine(ctx);
+      lastSeenMessages = [];
+      lastSeenSession = null;
+      if (engine.config.enabled && ctx.hasUI) {
+        ctx.ui.setStatus(
+          ENGINE_ID,
+          `context-engine on (prune ${resolveThresholds(engine.config, toModelInfo(ctx.model)).prune})`,
+        );
+      }
+    } catch (err) {
+      engine = null;
+      try {
+        console.error(`[${ENGINE_ID}] startup failed:`, String(err));
+      } catch {
+        // nothing else to do
+      }
     }
   });
 
   pi.on("session_shutdown", () => {
     engine = null;
+    lastSeenMessages = [];
+    lastSeenSession = null;
   });
 
   pi.on("context", async (event, ctx) => {
@@ -559,6 +605,7 @@ export default function (pi: ExtensionAPI): void {
     if (!e || !e.config.enabled) return;
     try {
       lastSeenMessages = event.messages as AnyMessage[];
+      lastSeenSession = { id: e.sessionId, leaf: safeLeafId(ctx) };
       const model = toModelInfo(ctx.model);
       const usage = ctx.getContextUsage();
       const { analysis, classify } = analyzeContext({
@@ -571,7 +618,7 @@ export default function (pi: ExtensionAPI): void {
       });
 
       const checkpointFresh = checkpointIsFresh(e);
-      const plan = planAutomatic(
+      let plan = planAutomatic(
         { analysis, state: e.state, config: e.config, model, checkpointFresh },
         e.state,
       );
@@ -606,14 +653,37 @@ export default function (pi: ExtensionAPI): void {
             Math.max(0, analysis.totalTokens - result.removedTokens),
           );
           persistState(e);
+          if (armed) e.cleanArmed = { until: 0 }; // consumed by this pass (P2)
+
+          // Recompute pressure after pruning and escalate within this event
+          // (spec §42: prune → recompute → compact). The checkpoint step is
+          // still decided by the plan (fresh checkpoint or auto-checkpoint
+          // fires below); compaction can be triggered right away if the
+          // post-prune pressure already crosses its threshold.
+          if (!plan.compact && e.config.auto.compact) {
+            const postPressure = Math.max(
+              0,
+              (analysis.totalTokens - result.removedTokens) / analysis.usableTokens,
+            );
+            const t = resolveThresholds(e.config, model);
+            if (
+              postPressure >= t.compact &&
+              Date.now() - e.state.lastCompactAt >= e.config.cooldowns.compactMs
+            ) {
+              plan = { ...plan, compact: true };
+            }
+          }
         }
       }
 
-      // 2) re-inject pins (they must survive pruning, spec §15)
+      // 2) re-inject pins (they must survive pruning, spec §15) — audited.
       const activePins = e.pins.active();
       if (activePins.length) {
         const ensured = ensurePinsInContext(messages, activePins);
-        if (ensured.injected.length) messages = ensured.messages;
+        if (ensured.injected.length) {
+          messages = ensured.messages;
+          e.auditor.event("pins_injected", { pins: ensured.injected.map((p) => p.id) });
+        }
       }
 
       // 3) checkpoint (fire-and-forget; never blocks the model call)

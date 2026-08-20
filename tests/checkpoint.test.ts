@@ -46,25 +46,47 @@ test("validateCheckpoint rejects non-object input", () => {
   assert.ok(!validateCheckpoint(null).ok);
 });
 
-test("validateCheckpoint normalizes decisions and issues", () => {
+test("validateCheckpoint: valid enums accepted, absent optional defaults applied", () => {
   const r = validateCheckpoint(
     {
       ...VALID,
       decisions: [
-        { decision: "d1", status: "weird-status" },
-        { decision: "  " }, // dropped
+        { decision: "d1" }, // status absent → defaults to active
         { decision: "d2", reason: "r", status: "superseded" },
       ],
-      issues: [{ description: "  ", status: "open" }, { description: "real", status: "bogus" }],
+      issues: [{ description: "real" }], // status absent → defaults to open
     },
   );
   assert.ok(r.ok, r.errors.join("; "));
   const cp = r.checkpoint!;
   assert.equal(cp.decisions.length, 2);
-  assert.equal(cp.decisions[0].status, "active"); // normalized default
+  assert.equal(cp.decisions[0].status, "active");
   assert.equal(cp.decisions[1].status, "superseded");
   assert.equal(cp.issues.length, 1);
-  assert.equal(cp.issues[0].status, "open"); // normalized default
+  assert.equal(cp.issues[0].status, "open");
+});
+
+test("validateCheckpoint: invalid enum values are rejected (not normalized)", () => {
+  const r1 = validateCheckpoint({
+    ...VALID,
+    decisions: [{ decision: "d1", status: "weird-status" }],
+  });
+  assert.ok(!r1.ok);
+  assert.ok(r1.errors.some((e) => e.includes("decisions[0].status")));
+
+  const r2 = validateCheckpoint({
+    ...VALID,
+    issues: [{ description: "real", status: "bogus" }],
+  });
+  assert.ok(!r2.ok);
+  assert.ok(r2.errors.some((e) => e.includes("issues[0].status")));
+
+  const r3 = validateCheckpoint({
+    ...VALID,
+    decisions: [{ decision: "   " }],
+  });
+  assert.ok(!r3.ok);
+  assert.ok(r3.errors.some((e) => e.includes("decisions[0].decision")));
 });
 
 test("extractJson handles raw, fenced, and prose-wrapped JSON", () => {
@@ -156,4 +178,27 @@ test("checkpointSystemPrompt mandates the exact schema and forbids prose", () =>
   assert.ok(p.includes("task.goal"));
   assert.ok(p.includes("constraints"));
   assert.ok(!/summarize the conversation/i.test(p));
+});
+
+test("strict validation: rejects wrong version and malformed elements", () => {
+  const badVersion = { ...VALID, version: 2 };
+  assert.ok(!validateCheckpoint(badVersion).ok);
+  assert.ok(validateCheckpoint({ ...VALID, version: undefined }).ok, "absent version defaults to 1");
+
+  const badArray = { ...VALID, constraints: ["ok", 42, null] };
+  const r = validateCheckpoint(badArray);
+  assert.ok(!r.ok, "non-string array elements rejected");
+  assert.ok(r.errors.some((e) => e.includes("constraints[1]")));
+
+  const badStatus = { ...VALID, task: { ...(VALID.task as Record<string, unknown>), status: "exploding" } };
+  assert.ok(!validateCheckpoint(badStatus).ok);
+
+  const badIssue = { ...VALID, issues: ["not-an-object"] };
+  assert.ok(!validateCheckpoint(badIssue).ok);
+
+  const badDate = { ...VALID, created_at: "not-a-date" };
+  assert.ok(!validateCheckpoint(badDate).ok);
+
+  const badDecision = { ...VALID, decisions: [{ decision: "  " }] };
+  assert.ok(!validateCheckpoint(badDecision).ok);
 });
