@@ -906,23 +906,15 @@ export default function (pi: ExtensionAPI): void {
       }
 
       // 5. ESCALATE: checkpoint, compact, handoff suggestions
-      if (plan.checkpoint && !e.checkpointBusy) {
-        e.state.actionHistory = [
-          ...(e.state.actionHistory ?? []).slice(-19),
-          { action: "checkpoint", timestamp: Date.now(), turn: e.state.turnCount },
-        ];
-        markBandActive(e.state, "checkpoint");
-        persistState(e);
-        void runCheckpoint(e, ctx, messages, "auto").then((r) =>
-          notify(
-            ctx,
-            r.ok ? r.text : `auto checkpoint failed: ${r.text}`,
-            r.ok ? "info" : "warning",
-          ),
-        );
-      }
-
-      if (plan.compact) {
+      //
+      // G4 (§4): a checkpoint must exist before we compact. When both are
+      // planned, the checkpoint runs to completion FIRST and compaction is
+      // chained after it. Firing them concurrently lets ctx.compact()'s
+      // abort() kill the in-flight checkpoint LLM call (it shares the
+      // session abort signal), which surfaces as "checkpoint must be a JSON
+      // object" and leaves the compaction unanchored.
+      const startAutoCompact = (): void => {
+        if (!plan.compact) return;
         e.state.lastCompactAt = Date.now();
         e.state.lastCompactPressureBefore = analysis.pressure;
         e.state.actionHistory = [
@@ -931,11 +923,16 @@ export default function (pi: ExtensionAPI): void {
         ];
         markBandActive(e.state, "compact");
         persistState(e);
-        e.auditor.event("compact", { triggered: "auto", pressure: analysis.pressure });
+        const cp = loadLatestCheckpoint(e);
+        e.auditor.event("compact", {
+          triggered: "auto",
+          pressure: analysis.pressure,
+          anchored: cp !== null,
+        });
 
         ctx.compact({
           customInstructions: compactInstructions(
-            loadLatestCheckpoint(e),
+            cp,
             e.pins.active(),
             (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
           ),
@@ -949,6 +946,29 @@ export default function (pi: ExtensionAPI): void {
           },
           onError: (err) => notify(ctx, `auto compaction failed: ${err.message}`, "error"),
         });
+      };
+
+      if (plan.checkpoint && !e.checkpointBusy) {
+        e.state.actionHistory = [
+          ...(e.state.actionHistory ?? []).slice(-19),
+          { action: "checkpoint", timestamp: Date.now(), turn: e.state.turnCount },
+        ];
+        markBandActive(e.state, "checkpoint");
+        persistState(e);
+        void runCheckpoint(e, ctx, messages, "auto").then((r) => {
+          notify(
+            ctx,
+            r.ok ? r.text : `auto checkpoint failed: ${r.text}`,
+            r.ok ? "info" : "warning",
+          );
+          // G4: compact only after the checkpoint settles. Pressure relief
+          // still wins when the checkpoint failed (runCheckpoint's
+          // fail-streak circuit breaker guards repeated failures) - the
+          // compaction just runs unanchored, as before the fix.
+          startAutoCompact();
+        });
+      } else {
+        startAutoCompact();
       }
 
       if (plan.handoffSuggest && Date.now() - e.lastHandoffSuggestAt > 10 * 60_000) {

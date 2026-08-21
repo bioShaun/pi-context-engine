@@ -160,6 +160,193 @@ test("T1 (D1): one auto compact increments compactionCount exactly once", async 
   }
 });
 
+test("T7 (G4 race): auto compact waits for the checkpoint to settle", async () => {
+  const { mkdtempSync, writeFileSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  // Before the fix, the context handler fired the checkpoint with `void` and
+  // called ctx.compact() in the same tick; pi's compact() starts with
+  // `await this.abort()`, which killed the in-flight checkpoint LLM call
+  // (empty raw -> "checkpoint must be a JSON object") and left the compaction
+  // unanchored. The fix chains compact after the checkpoint settles.
+  const setup = async (
+    sessionId: string,
+    complete: () => Promise<unknown>,
+  ): Promise<{
+    handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
+    ctx: Record<string, unknown>;
+    compactCalls: Array<{ customInstructions?: string }>;
+    stateFile: string;
+    cleanup: () => Promise<void>;
+  }> => {
+    const tmp = mkdtempSync(join(tmpdir(), "pce-t7-"));
+    const stateDir = join(tmp, "state");
+    const cfgPath = join(tmp, "config.json");
+    // Reproduce the incident band: compact.enter BELOW checkpoint.enter
+    // (as the qwen* model override does: 0.78 < 0.80). In that window
+    // decide() returns action "compact" while the checkpoint is stale, so
+    // planAutomatic plans BOTH checkpoint and compact - the race condition.
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        enabled: true,
+        stateDir,
+        auto: { prune: true, checkpoint: true, compact: true },
+        thresholds: {
+          prune: { enter: 0.65, exit: 0.55 },
+          checkpoint: { enter: 0.86, exit: 0.70 },
+          compact: { enter: 0.80, exit: 0.70 },
+          handoff: { enter: 0.94 },
+        },
+        policy: DEFAULT_CONFIG.policy,
+        checkpoint: { ...DEFAULT_CONFIG.checkpoint, model: null },
+      }),
+    );
+    process.env.PI_CONTEXT_ENGINE_CONFIG = cfgPath;
+
+    const { default: extensionFactory } = await import("../src/index.ts");
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      on: (ev: string, fn: (event: unknown, ctx: unknown) => unknown) => void handlers.set(ev, fn),
+      registerCommand: () => {},
+      exec: async () => ({ stdout: "", stderr: "", code: 0 }),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    extensionFactory(pi as any);
+
+    const compactCalls: Array<{ customInstructions?: string }> = [];
+    // ~72k tokens against ~87.7k usable -> pressure ≈ 0.82, inside the
+    // inverted band [compact.enter 0.80, checkpoint.enter 0.86).
+    const usage = { tokens: 72_000, contextWindow: 100_000, percent: 72 };
+    const ctx = {
+      cwd: tmp,
+      hasUI: true,
+      mode: "print",
+      model: { provider: "test", id: "test-model", contextWindow: 100_000, maxTokens: 8192 },
+      modelRegistry: { complete },
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getBranch: () => [],
+        getLeafId: () => "leaf-1",
+        buildContextEntries: () => [],
+        getSessionFile: () => join(tmp, "session.jsonl"),
+      },
+      getContextUsage: () => usage,
+      ui: { notify: () => {}, setStatus: () => {} },
+      compact: (opts: { customInstructions?: string; onComplete?: () => void }) => {
+        compactCalls.push(opts);
+        opts.onComplete?.();
+      },
+    };
+    return {
+      handlers,
+      ctx,
+      compactCalls,
+      stateFile: join(stateDir, "sessions", sessionId, "state.json"),
+      cleanup: async () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await handlers.get("session_shutdown")?.({}, ctx as any);
+        delete process.env.PI_CONTEXT_ENGINE_CONFIG;
+      },
+    };
+  };
+
+  const waitFor = async (pred: () => boolean, ms = 2000): Promise<void> => {
+    for (let i = 0; i < ms / 10 && !pred(); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+
+  const VALID_CP = JSON.stringify({
+    version: 1,
+    created_at: new Date().toISOString(),
+    task: { goal: "migrate the database safely", phase: "p", status: "in_progress" },
+    requirements: [],
+    constraints: ["never drop the prod table"],
+    decisions: [],
+    files: { inspected: [], modified: [], created: [], deleted: [] },
+    verification: { passed: [], failed: [], pending: [] },
+    issues: [],
+    next_actions: ["run the migration dry-run"],
+  });
+  const readState = (
+    file: string,
+  ): { checkpointCount?: number; checkpointFailStreak?: number } => {
+    try {
+      return JSON.parse(readFileSync(file, "utf8")).state ?? {};
+    } catch {
+      return {};
+    }
+  };
+
+  // Scenario A: checkpoint succeeds -> compact is chained after it and anchored.
+  {
+    const s = await setup("t7a-session", async () => {
+      await new Promise((r) => setTimeout(r, 30)); // simulate LLM latency
+      return { stopReason: "stop", content: [{ type: "text", text: VALID_CP }] };
+    });
+    try {
+      const messages = [userMsg("do the task"), assistantText("working on it")];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("session_start")?.({}, s.ctx as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("context")?.({ messages }, s.ctx as any);
+
+      // The compact must NOT fire in the same tick as the context event:
+      // the checkpoint LLM call is still in flight.
+      assert.equal(s.compactCalls.length, 0, "compact must wait for the checkpoint");
+
+      await waitFor(() => (readState(s.stateFile).checkpointCount ?? 0) >= 1);
+      assert.ok(
+        (readState(s.stateFile).checkpointCount ?? 0) >= 1,
+        "auto checkpoint should complete first",
+      );
+      assert.equal(s.compactCalls.length, 1, "compact fires exactly once, after the checkpoint");
+      const instructions = s.compactCalls[0]?.customInstructions ?? "";
+      assert.ok(
+        instructions.includes("never drop the prod table"),
+        "compaction instructions must be anchored by the fresh checkpoint (constraint)",
+      );
+      assert.ok(
+        instructions.includes("run the migration dry-run"),
+        "compaction instructions must carry the checkpoint's next action",
+      );
+    } finally {
+      await s.cleanup();
+    }
+  }
+
+  // Scenario B: checkpoint fails -> compact still fires (pressure relief), unanchored.
+  {
+    const s = await setup("t7b-session", async () => ({
+      stopReason: "stop",
+      content: [{ type: "text", text: "not json at all" }],
+    }));
+    try {
+      const messages = [userMsg("do the task"), assistantText("working on it")];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("session_start")?.({}, s.ctx as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("context")?.({ messages }, s.ctx as any);
+
+      await waitFor(() => s.compactCalls.length === 1);
+      assert.equal(s.compactCalls.length, 1, "failed checkpoint must not block pressure relief");
+      assert.equal(
+        readState(s.stateFile).checkpointFailStreak,
+        1,
+        "checkpoint failure is recorded for the circuit breaker",
+      );
+      assert.ok(
+        typeof s.compactCalls[0]?.customInstructions === "string",
+        "unanchored compaction still carries base instructions",
+      );
+    } finally {
+      await s.cleanup();
+    }
+  }
+});
+
 test("T2 (D2): Pin matching case normalization", () => {
   // Case A: text pin "CRITICAL_PATH" matched against lowercase text in message
   const textPin: Pin = {
