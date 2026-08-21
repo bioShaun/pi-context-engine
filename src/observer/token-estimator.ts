@@ -8,13 +8,31 @@
 
 import type { AnyMessage, TextPart } from "../types.ts";
 
-const CHARS_PER_TOKEN = 4;
-/** Rough token cost of one image block (pi-ai image sizing). */
 export const IMAGE_TOKENS = 1600;
 
+/**
+ * CJK-aware token estimation (spec §4.4).
+ * tokens ≈ ceil(asciiChars / 4 + cjkChars / 1.5)
+ */
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
+  let cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3400 && code <= 0x4dbf) ||
+      (code >= 0x3040 && code <= 0x30ff) ||
+      (code >= 0xac00 && code <= 0xd7af) ||
+      (code >= 0x3000 && code <= 0x303f) ||
+      (code >= 0xff00 && code <= 0xffee) ||
+      (code >= 0xd800 && code <= 0xdbff)
+    ) {
+      cjk++;
+    }
+  }
+  const ascii = text.length - cjk;
+  return Math.ceil(ascii / 4 + cjk / 1.5);
 }
 
 function blockTokens(block: unknown): number {

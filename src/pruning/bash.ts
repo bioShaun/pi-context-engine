@@ -83,17 +83,29 @@ export function foldBashOutput(
   const head = lines.slice(0, maxHead);
   const tail = lines.slice(-maxTail);
 
-  // Collect error lines (dedupe, keep order, cap).
-  const errors: string[] = [];
-  const seen = new Set<string>();
-  for (const line of lines) {
-    if (errors.length >= maxErrors) break;
-    if (ERROR_LINE_RE.test(line)) {
-      const key = line.trim().slice(0, 160);
-      if (key && !seen.has(key)) {
-        seen.add(key);
-        errors.push(key);
+  // Collect error lines with ±2 lines context window (spec §8.3).
+  const errorIndices = new Set<number>();
+  for (let i = 0; i < lines.length; i++) {
+    if (ERROR_LINE_RE.test(lines[i])) {
+      const from = Math.max(0, i - 2);
+      const to = Math.min(lines.length - 1, i + 2);
+      for (let j = from; j <= to; j++) {
+        errorIndices.add(j);
       }
+    }
+  }
+
+  const headIndices = new Set(Array.from({ length: head.length }, (_, i) => i));
+  const tailIndices = new Set(Array.from({ length: tail.length }, (_, i) => lines.length - tail.length + i));
+
+  const sortedIndices = Array.from(errorIndices).sort((a, b) => a - b);
+  const errors: string[] = [];
+  for (const idx of sortedIndices) {
+    if (errors.length >= maxErrors) break;
+    if (headIndices.has(idx) || tailIndices.has(idx)) continue;
+    const line = lines[idx].trim().slice(0, 160);
+    if (line) {
+      errors.push(line);
     }
   }
 

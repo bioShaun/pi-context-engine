@@ -15,25 +15,43 @@ import { messageText } from "../observer/token-estimator.ts";
 export class PinStore {
   private load: () => unknown;
   private save: (pins: Pin[]) => void;
+  private cachedPins: Pin[] | null = null;
+
   constructor(load: () => unknown, save: (pins: Pin[]) => void) {
     this.load = load;
     this.save = save;
   }
 
-  all(): Pin[] {
+  private loadInternal(): Pin[] {
+    if (this.cachedPins !== null) return this.cachedPins;
     const raw = this.load();
-    if (!raw || typeof raw !== "object") return [];
+    if (!raw || typeof raw !== "object") {
+      this.cachedPins = [];
+      return this.cachedPins;
+    }
     const arr = (raw as { pins?: unknown }).pins;
-    if (!Array.isArray(arr)) return [];
-    return arr.filter((p): p is Pin => !!p && typeof p === "object" && typeof (p as Pin).id === "string");
+    if (!Array.isArray(arr)) {
+      this.cachedPins = [];
+      return this.cachedPins;
+    }
+    this.cachedPins = arr.filter(
+      (p): p is Pin => !!p && typeof p === "object" && typeof (p as Pin).id === "string",
+    );
+    return this.cachedPins;
+  }
+
+  all(): Pin[] {
+    return [...this.loadInternal()];
   }
 
   active(): Pin[] {
     return this.all().filter((p) => p.active);
   }
 
-  private persist(pins: Pin[]): void {
-    this.save(pins);
+  private persist(): void {
+    if (this.cachedPins) {
+      this.save(this.cachedPins);
+    }
   }
 
   add(
@@ -42,9 +60,16 @@ export class PinStore {
     sourceMessageId?: string,
     expires: Pin["expires"] = "manual",
   ): Pin {
-    const pins = this.all();
-    // De-duplicate identical active pins.
-    const existing = pins.find((p) => p.active && p.type === type && p.content === content);
+    const pins = this.loadInternal();
+    // De-duplicate identical active pins (case-insensitive for files, trimmed comparison for text).
+    const existing = pins.find(
+      (p) =>
+        p.active &&
+        p.type === type &&
+        (type === "file"
+          ? p.content.toLowerCase() === content.trim().toLowerCase()
+          : p.content === content.trim()),
+    );
     if (existing) return existing;
     const pin: Pin = {
       id: shortId(),
@@ -56,16 +81,16 @@ export class PinStore {
       active: true,
     };
     pins.push(pin);
-    this.persist(pins);
+    this.persist();
     return pin;
   }
 
   remove(id: string): Pin | undefined {
-    const pins = this.all();
+    const pins = this.loadInternal();
     const idx = pins.findIndex((p) => p.id === id);
     if (idx < 0) return undefined;
     const [removed] = pins.splice(idx, 1);
-    this.persist(pins);
+    this.persist();
     return removed;
   }
 
@@ -117,14 +142,16 @@ export function ensurePinsInContext(
     }
   }
   const corpusJoined = corpus.join("\n");
+  const corpusLower = corpusJoined.toLowerCase();
 
   const missing = active.filter((p) => {
     if (p.type === "file") {
-      // File pins only re-inject when the file is not in context at all.
-      return !corpusJoined.includes(p.content.toLowerCase());
+      // File pins only re-inject when the file is not in context at all (case-insensitive).
+      const pLower = p.content.toLowerCase().trim();
+      return !corpusLower.includes(pLower);
     }
-    const needle = p.content.slice(0, 100).trim();
-    return !needle || !corpusJoined.includes(needle);
+    const needle = p.content.slice(0, 100).trim().toLowerCase();
+    return !needle || !corpusLower.includes(needle);
   });
 
   if (!missing.length) return { messages: [...messages], injected: [] };

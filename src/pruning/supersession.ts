@@ -15,7 +15,7 @@
 
 import type { AnyMessage, ResolvedToolCall } from "../types.ts";
 import { normalizeCommand, testGroupKey, categorizeCommand } from "./bash.ts";
-import { readGroupKey } from "./read.ts";
+import { readGroupKey, getReadRange, readRangesOverlap, type ReadRange } from "./read.ts";
 import { searchGroupKey } from "./grep.ts";
 
 export interface SupersessionGroup {
@@ -61,12 +61,30 @@ export function computeSupersession(
   toolCalls: Map<string, ResolvedToolCall>,
 ): SupersessionInfo {
   const groups = new Map<string, SupersessionGroup>();
+  const readOccurrences = new Map<
+    string,
+    Array<{ index: number; call: ResolvedToolCall; range: ReadRange }>
+  >();
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role !== "toolResult") continue;
     const call = msg.toolCallId ? toolCalls.get(msg.toolCallId) : undefined;
     if (!call) continue;
+
+    if (call.name === "read") {
+      const key = readGroupKey(call);
+      if (key) {
+        let occ = readOccurrences.get(key);
+        if (!occ) {
+          occ = [];
+          readOccurrences.set(key, occ);
+        }
+        occ.push({ index: i, call, range: getReadRange(call) });
+      }
+      continue;
+    }
+
     const key = groupKeyForCall(call);
     if (!key) continue;
 
@@ -80,6 +98,8 @@ export function computeSupersession(
 
   const superseded = new Map<number, SupersessionGroup>();
   const all: SupersessionGroup[] = [];
+
+  // Non-read tool groups
   for (const group of groups.values()) {
     all.push(group);
     if (group.memberIndexes.length <= 1) continue;
@@ -88,5 +108,34 @@ export function computeSupersession(
       if (idx !== last) superseded.set(idx, group);
     }
   }
+
+  // Read tool supersession with range overlap check (spec §8.2)
+  for (const [key, occ] of readOccurrences.entries()) {
+    const group: SupersessionGroup = {
+      key,
+      tool: "read",
+      memberIndexes: occ.map((o) => o.index),
+      label: key,
+    };
+    all.push(group);
+
+    if (occ.length <= 1) continue;
+
+    for (let i = 0; i < occ.length - 1; i++) {
+      const earlier = occ[i];
+      // Check if any later read of this file supersedes this earlier read
+      for (let j = i + 1; j < occ.length; j++) {
+        const later = occ[j];
+        if (later.range.isFull || readRangesOverlap(earlier.range, later.range)) {
+          superseded.set(earlier.index, {
+            ...group,
+            memberIndexes: [earlier.index, later.index],
+          });
+          break;
+        }
+      }
+    }
+  }
+
   return { superseded, groups: all };
 }

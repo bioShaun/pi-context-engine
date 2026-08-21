@@ -14,13 +14,40 @@ import { checkpointSystemPrompt, validateCheckpoint } from "./schema.ts";
  * Serialize the effective conversation into text for the checkpoint LLM.
  * Tool results are heavily truncated — the checkpoint cares about decisions,
  * state and constraints, not raw output.
+ *
+ * When over length, preserves:
+ * [First user message (goal, up to 2K chars)] + [All active pins] + [Tail window] (spec §7.3).
  */
 export function serializeConversation(
   messages: readonly AnyMessage[],
-  opts: { maxToolChars?: number; maxTotalChars?: number } = {},
+  opts: { maxToolChars?: number; maxTotalChars?: number; pins?: Pin[] } = {},
 ): string {
   const maxTool = opts.maxToolChars ?? 400;
   const maxTotal = opts.maxTotalChars ?? 120_000;
+
+  // Extract first user message (up to 2K characters)
+  let firstUserText = "";
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      const text = messageText(msg).trim();
+      if (text) {
+        firstUserText = `User (Initial Goal): ${text.slice(0, 2000)}`;
+        break;
+      }
+    }
+  }
+
+  // Active pins summary
+  let pinsText = "";
+  if (opts.pins && opts.pins.length) {
+    const activePins = opts.pins.filter((p) => p.active);
+    if (activePins.length) {
+      pinsText =
+        `Active Pins:\n` +
+        activePins.map((p) => `- [${p.type}] ${p.content}`).join("\n");
+    }
+  }
+
   const sections: string[] = [];
 
   for (const msg of messages) {
@@ -80,9 +107,22 @@ export function serializeConversation(
     }
   }
 
-  let text = sections.join("\n\n");
-  if (text.length > maxTotal) text = text.slice(-maxTotal);
-  return text;
+  const fullBody = sections.join("\n\n");
+  if (fullBody.length <= maxTotal) {
+    return fullBody;
+  }
+
+  const headParts: string[] = [];
+  if (firstUserText) headParts.push(firstUserText);
+  if (pinsText) headParts.push(pinsText);
+  const headStr = headParts.join("\n\n");
+  const headBudget = headStr ? headStr.length + 4 : 0;
+  const tailBudget = Math.max(1000, maxTotal - headBudget);
+  const tailStr = fullBody.slice(-tailBudget);
+
+  return headStr
+    ? `${headStr}\n\n[... earlier conversation truncated ...]\n\n${tailStr}`
+    : tailStr;
 }
 
 /**
@@ -182,7 +222,7 @@ export async function generateCheckpoint(
   inputs: GenerateInputs,
   store: { saveCheckpoint: (cp: Checkpoint) => { path: string; name: string } },
 ): Promise<GenerateResult> {
-  const conversation = serializeConversation(inputs.messages);
+  const conversation = serializeConversation(inputs.messages, { pins: inputs.pins });
   if (!conversation.trim()) {
     return { ok: false, errors: ["empty conversation — nothing to checkpoint"], raw: conversation };
   }

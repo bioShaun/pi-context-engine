@@ -54,6 +54,14 @@ export class Auditor {
   metric(data: Record<string, unknown>): void {
     this.event("metric", data);
   }
+
+  flush(): void {
+    try {
+      this.store.flush();
+    } catch {
+      // fail-open
+    }
+  }
 }
 
 export function getState(store: SessionStore): EngineState {

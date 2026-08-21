@@ -138,10 +138,10 @@ test("resolveThresholds applies model globs", () => {
       "testprovider/testmodel": { prune: 0.42 },
     },
   };
-  assert.equal(resolveThresholds(cfg, { provider: "qwen", id: "qwen3-coder" }).prune, 0.5);
-  assert.equal(resolveThresholds(cfg, { provider: "qwen", id: "qwen3-coder" }).compact, 0.7);
-  assert.equal(resolveThresholds(cfg, { provider: "testprovider", id: "testmodel" }).prune, 0.42);
-  assert.equal(resolveThresholds(cfg, { provider: "other", id: "model" }).prune, config.thresholds.prune);
+  assert.equal(resolveThresholds(cfg, { provider: "qwen", id: "qwen3-coder" }).prune.enter, 0.5);
+  assert.equal(resolveThresholds(cfg, { provider: "qwen", id: "qwen3-coder" }).compact.enter, 0.7);
+  assert.equal(resolveThresholds(cfg, { provider: "testprovider", id: "testmodel" }).prune.enter, 0.42);
+  assert.deepEqual(resolveThresholds(cfg, { provider: "other", id: "model" }).prune, config.thresholds.prune);
 });
 
 test("bandLabel matches spec bands", () => {

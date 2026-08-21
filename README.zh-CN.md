@@ -10,7 +10,7 @@
 - 生成自包含 handoff 提示词，**交接**给全新会话（`/context handoff`）
 - **pin（钉住）**关键约束，使其在任何破坏性操作后依然存在
 
-[English documentation](README.md) · [设计规格（zh）](docs/pi-context-engine.spec.md)
+[English documentation](README.md) · [设计规格（zh）](docs/pi-context-engine.spec.md) · [v0.2 自动优化规格（zh）](docs/pi-context-engine.auto-optimization.spec.md)
 
 ```
 pi 原生会话（从不修改）  ──►  context 事件  ──►  有效上下文
@@ -93,18 +93,41 @@ quality   = (critical + working tokens) / 总 tokens
 | pressure ≥ 88% | **自动 compact**（checkpoint 锚定） |
 | pressure ≥ 94% 且 compact ≥ 2 次 且 quality < 50% | **建议 handoff**（永不自动执行） |
 
-模型专属阈值通过配置覆盖（例如小参数本地模型更早触发 prune/compact）。
-所有自动行为均可单独开关，且全部留有审计记录。
+模型专属阈值通过配置覆盖（例如小参数本地模型更早触发 prune/compact；
+多 pattern 命中时特异性最高者生效）。所有自动行为均可单独开关，且全部留有审计记录。
+
+自动动作具备防震荡与成本守恒机制（v0.2）：每个动作有 enter/exit 双阈值
+（需连续两轮低于 `exit` 才能再次进入）、冷却期（prune 15s / compact 300s）、
+频率限制（每 10 轮最多 3 次，超限降级为仅通知）。checkpoint 失败后指数退避
+（30s → 60s → 120s → … 封顶 10 分钟），连续失败 3 次熔断，并有会话级预算
+（`maxPerSession`）。checkpoint 的新鲜度需同时满足：墙钟 < 10 分钟、
+新增 tokens < 20K、新增消息 < 30 条。
 
 ```json
 {
   "enabled": true,
   "auto": { "prune": true, "checkpoint": true, "compact": true },
   "handoff": { "mode": "suggest" },
-  "thresholds": { "prune": 0.65, "checkpoint": 0.80, "compact": 0.88, "handoff": 0.94 },
-  "models": { "qwen*": { "prune": 0.55, "compact": 0.78 } }
+  "thresholds": {
+    "prune":      { "enter": 0.65, "exit": 0.55 },
+    "checkpoint": { "enter": 0.80, "exit": 0.70 },
+    "compact":    { "enter": 0.88, "exit": 0.78 },
+    "handoff":    { "enter": 0.94 }
+  },
+  "policy": { "reclaimableMin": 5000, "maxActionsPer10Turns": 3, "adaptiveThresholds": true },
+  "checkpoint": { "model": null, "maxPerSession": 20 },
+  "prune": { "bands": [
+    { "pressureGte": 0.88, "stubMinTokens": 20, "foldMaxChars": 1200 },
+    { "pressureGte": 0.80, "stubMinTokens": 30, "foldMaxChars": 1600 },
+    { "pressureGte": 0.0,  "stubMinTokens": 50, "foldMaxChars": 2200 }
+  ]},
+  "models": { "qwen*": { "prune": { "enter": 0.55, "exit": 0.45 }, "compact": { "enter": 0.78, "exit": 0.68 } } }
 }
 ```
+
+v0.1 的扁平阈值（`"prune": 0.65`）仍可加载——会自动迁移为
+`{ enter, exit: enter − 0.10 }`（记 `config_migrated` 审计事件）。
+非法值回退为默认值（记 `config_sanitized`）。
 
 ## 什么会被裁剪
 
@@ -149,7 +172,8 @@ npm run typecheck
 
 ## 路线图（spec §47–49）
 
-- v0.2：checkpoint 自动刷新、Pi compaction hook 集成、更好的测试结果折叠、
-  git 感知的 diff 跟踪、任务阶段检测
+- v0.2（已完成）：自动优先流水线——统一 token 计量（CJK 感知 + 校准）、
+  enter/exit 双阈值防震荡与频率限制、checkpoint 退避/熔断/预算、
+  压力分档裁剪、区间感知的 read 取代判定
 - v0.3：handoff 评分、新会话自动引导、checkpoint 恢复
 - v0.4：语义折叠（embedding / 按需召回）

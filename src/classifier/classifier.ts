@@ -422,8 +422,16 @@ function applyPins(items: ContextItem[], messages: readonly AnyMessage[], pins: 
     .filter((p) => p.active && p.type === "file")
     .map((p) => normalizePathLike(p.content));
   const textPins = pins
-    .filter((p) => p.active && (p.type === "constraint" || p.type === "requirement" || p.type === "note" || p.type === "command"))
-    .map((p) => normalizePathLike(p.content).slice(0, 120));
+    .filter(
+      (p) =>
+        p.active &&
+        (p.type === "constraint" ||
+          p.type === "requirement" ||
+          p.type === "note" ||
+          p.type === "command"),
+    )
+    .map((p) => p.content.trim().slice(0, 120).toLowerCase())
+    .filter(Boolean);
 
   for (const item of items) {
     if (item.engineStub) continue;
@@ -434,7 +442,7 @@ function applyPins(items: ContextItem[], messages: readonly AnyMessage[], pins: 
       if (files.some((f) => filePins.includes(f))) pinned = true;
     }
     if (!pinned && textPins.length) {
-      const text = messageText(msg);
+      const text = messageText(msg).toLowerCase();
       if (textPins.some((p) => p && text.includes(p))) pinned = true;
     }
     if (pinned) {

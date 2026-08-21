@@ -8,6 +8,21 @@ export const DEFAULT_STATE: EngineState = {
   lastPruneAt: 0,
   lastCheckpointAt: 0,
   lastCompactAt: 0,
+  lastCheckpointAttemptAt: 0,
+  checkpointFailStreak: 0,
+  checkpointCircuitBroken: false,
+  checkpointDisabledReason: undefined,
+  tokensAtLastCheckpoint: 0,
+  messagesAtLastCheckpoint: 0,
+  lastCompactPressureBefore: undefined,
+  consecutiveIneffectiveCompacts: 0,
+  consecutiveIneffectivePrunes: 0,
+  adaptivePruneEnterDelta: 0,
+  adaptiveCompactEnterDelta: 0,
+  actionHistory: [],
+  turnCount: 0,
+  bandActive: { prune: false, checkpoint: false, compact: false },
+  lowPressureStreak: { prune: 0, checkpoint: 0, compact: 0 },
 };
 
 export function loadState<T extends EngineState>(store: SessionStore): T | undefined {

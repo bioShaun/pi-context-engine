@@ -16,18 +16,15 @@ import type {
   ContextAnalysis,
   ContextItem,
   PruneAction,
+  PruneOptions,
   PruneResult,
 } from "../types.ts";
 import { ENGINE_ID } from "../types.ts";
 import { estimateTextTokens, messageText } from "../observer/token-estimator.ts";
 import { foldBashOutput } from "./bash.ts";
+import type { ContextEngineConfig } from "../config.ts";
 
-export interface PruneOptions {
-  stubMinTokens: number;
-  foldMaxChars: number;
-  /** "auto" = policy-driven; "manual" = /context clean (more aggressive). */
-  mode: "auto" | "manual";
-}
+export type { PruneOptions };
 
 export const AUTO_PRUNE_OPTS: PruneOptions = {
   stubMinTokens: 50,
@@ -36,10 +33,43 @@ export const AUTO_PRUNE_OPTS: PruneOptions = {
 };
 
 export const MANUAL_PRUNE_OPTS: PruneOptions = {
-  stubMinTokens: 30,
-  foldMaxChars: 1600,
+  stubMinTokens: 20,
+  foldMaxChars: 1200,
   mode: "manual",
 };
+
+export function getPruneOptsForPressure(
+  pressure: number,
+  config: ContextEngineConfig,
+  mode: "auto" | "manual" = "auto",
+): PruneOptions {
+  if (mode === "manual") {
+    const sorted = [...config.prune.bands].sort((a, b) => b.pressureGte - a.pressureGte);
+    const aggressive = sorted[0];
+    return {
+      stubMinTokens: aggressive ? aggressive.stubMinTokens : 20,
+      foldMaxChars: aggressive ? aggressive.foldMaxChars : 1200,
+      mode: "manual",
+    };
+  }
+
+  const sortedBands = [...config.prune.bands].sort((a, b) => b.pressureGte - a.pressureGte);
+  for (const band of sortedBands) {
+    if (pressure >= band.pressureGte) {
+      return {
+        stubMinTokens: band.stubMinTokens,
+        foldMaxChars: band.foldMaxChars,
+        mode: "auto",
+      };
+    }
+  }
+
+  return {
+    stubMinTokens: config.limits.stubMinTokens,
+    foldMaxChars: config.limits.foldMaxChars,
+    mode: "auto",
+  };
+}
 
 type Plan = "keep" | "stub" | "fold";
 

@@ -24,9 +24,14 @@ import { Container, Text, matchesKey } from "@earendil-works/pi-tui";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { loadConfig, resolveThresholds, type ContextEngineConfig } from "./config.ts";
-import { analyzeContext, type ModelInfo } from "./observer/context-observer.ts";
-import { pruneContext, AUTO_PRUNE_OPTS, MANUAL_PRUNE_OPTS } from "./pruning/pruner.ts";
-import { planAutomatic } from "./policy/engine.ts";
+import { analyzeContext, TokenCalibrator, type ModelInfo } from "./observer/context-observer.ts";
+import { pruneContext, getPruneOptsForPressure } from "./pruning/pruner.ts";
+import {
+  planAutomatic,
+  isCheckpointFresh,
+  updateHysteresisBands,
+  markBandActive,
+} from "./policy/engine.ts";
 import { SessionStore } from "./checkpoint/store.ts";
 import { generateCheckpoint, buildComplete } from "./checkpoint/checkpoint.ts";
 import { getLatestCheckpointPath } from "./checkpoint/latest.ts";
@@ -52,6 +57,7 @@ interface Engine {
   pins: PinStore;
   auditor: Auditor;
   state: EngineState;
+  calibrator: TokenCalibrator;
   /** Manual /context clean is armed: next context pass prunes aggressively. */
   cleanArmed: { until: number };
   checkpointBusy: boolean;
@@ -83,7 +89,17 @@ function createEngine(ctx: ExtensionContext): Engine {
   const store = new SessionStore(config.stateDir, sessionId);
   const pins = new PinStore(() => store.loadPins(), (p) => store.savePins(p));
   const auditor = new Auditor(store);
+  const calibrator = new TokenCalibrator(20);
   let state = loadState(store) ?? DEFAULT_STATE;
+
+  // Log any configuration migration / sanitization events (§11)
+  if (config._migrationEvents?.length) {
+    for (const ev of config._migrationEvents) {
+      auditor.event(ev.action, ev);
+    }
+    config._migrationEvents = [];
+  }
+
   // Compaction count comes from the session itself (survives restarts).
   try {
     const branch = ctx.sessionManager.getBranch();
@@ -93,6 +109,7 @@ function createEngine(ctx: ExtensionContext): Engine {
   } catch {
     // in-memory sessions etc. — keep loaded state
   }
+
   return {
     sessionId,
     config,
@@ -100,6 +117,7 @@ function createEngine(ctx: ExtensionContext): Engine {
     pins,
     auditor,
     state,
+    calibrator,
     cleanArmed: { until: 0 },
     checkpointBusy: false,
     lastHandoffSuggestAt: 0,
@@ -127,8 +145,18 @@ function loadLatestCheckpoint(e: Engine): Checkpoint | null {
   }
 }
 
-function checkpointIsFresh(e: Engine): boolean {
-  return Date.now() - e.state.lastCheckpointAt < e.config.cooldowns.checkpointFreshMs;
+function checkpointIsFresh(
+  e: Engine,
+  currentTokens?: number,
+  currentMessagesCount?: number,
+): boolean {
+  return isCheckpointFresh(
+    e.state,
+    e.config,
+    currentTokens,
+    currentMessagesCount,
+    Date.now(),
+  );
 }
 
 async function runCheckpoint(
@@ -145,12 +173,18 @@ async function runCheckpoint(
     return { ok: false, text: "no model available for checkpoint generation" };
   }
   e.checkpointBusy = true;
-  const notifySafe = (t: string, k: "info" | "warning" | "error" = "info") => notify?.(t, k);
+  e.state.lastCheckpointAttemptAt = Date.now();
+  persistState(e);
+
   try {
+    const targetModel = e.config.checkpoint?.model
+      ? { ...ctx.model, id: e.config.checkpoint.model }
+      : ctx.model;
+
     const result = await generateCheckpoint(
       {
         messages,
-        complete: buildComplete(ctx),
+        complete: buildComplete({ ...ctx, model: targetModel }),
         signal: ctx.signal,
         sessionId: e.sessionId,
         tokensBefore: ctx.getContextUsage()?.tokens ?? undefined,
@@ -159,13 +193,39 @@ async function runCheckpoint(
       },
       { saveCheckpoint: (cp) => e.store.saveCheckpoint(cp) },
     );
+
     if (!result.ok) {
-      e.auditor.event("checkpoint_failed", { source, errors: result.errors });
+      e.state.checkpointFailStreak = (e.state.checkpointFailStreak ?? 0) + 1;
+      const maxStreak = e.config.checkpoint?.maxFailStreak ?? 3;
+      if (e.state.checkpointFailStreak >= maxStreak) {
+        e.state.checkpointCircuitBroken = true;
+        e.state.checkpointDisabledReason = result.errors.join("; ");
+        e.auditor.event("checkpoint_circuit_broken", {
+          source,
+          streak: e.state.checkpointFailStreak,
+          errors: result.errors,
+        });
+        notify?.(
+          `auto checkpoint disabled: ${result.errors.join("; ")}`,
+          "warning",
+        );
+      }
+      persistState(e);
+      e.auditor.event("checkpoint_failed", {
+        source,
+        streak: e.state.checkpointFailStreak,
+        errors: result.errors,
+      });
       return { ok: false, text: `checkpoint failed: ${result.errors.join("; ")}` };
     }
+
+    e.state.checkpointFailStreak = 0;
     e.state.lastCheckpointAt = Date.now();
     e.state.checkpointCount += 1;
+    e.state.tokensAtLastCheckpoint = ctx.getContextUsage()?.tokens ?? undefined;
+    e.state.messagesAtLastCheckpoint = messages.length;
     persistState(e);
+
     const cp = result.checkpoint!;
     e.auditor.event("checkpoint", {
       source,
@@ -179,21 +239,58 @@ async function runCheckpoint(
       text: `checkpoint ${name} saved\n  goal: ${cp.task.goal}\n  constraints: ${cp.constraints.length}  ·  next: ${cp.next_actions[0] ?? "(none)"}`,
     };
   } catch (err) {
-    e.auditor.event("checkpoint_error", { source, error: String(err) });
+    e.state.checkpointFailStreak = (e.state.checkpointFailStreak ?? 0) + 1;
+    persistState(e);
+    e.auditor.event("checkpoint_error", {
+      source,
+      streak: e.state.checkpointFailStreak,
+      error: String(err),
+    });
     return { ok: false, text: `checkpoint error: ${String(err)}` };
   } finally {
     e.checkpointBusy = false;
   }
 }
 
-function compactInstructions(cp: Checkpoint | null): string {
+/**
+ * Build compaction custom instructions (spec §9.3).
+ * Includes recovery state, hard constraints from checkpoint & active pins,
+ * and aggressive pruning guidance when previous compact was ineffective.
+ */
+function compactInstructions(
+  cp: Checkpoint | null,
+  activePins: Pin[] = [],
+  lastCompactIneffective = false,
+): string {
   const parts: string[] = [
     "Keep the recovery state intact: goal, explicit user constraints, current implementation state, files touched, verification status, and next actions.",
   ];
-  if (cp) {
-    if (cp.constraints.length) parts.push(`Hard constraints: ${cp.constraints.join("; ")}.`);
-    if (cp.next_actions.length) parts.push(`Next action: ${cp.next_actions[0]}.`);
+
+  // Hard constraints from checkpoint and active pins
+  const allConstraints = new Set<string>();
+  if (cp?.constraints) {
+    for (const c of cp.constraints) allConstraints.add(c);
   }
+  for (const pin of activePins) {
+    if (pin.type === "constraint" || pin.type === "requirement") {
+      allConstraints.add(pin.content);
+    }
+  }
+
+  if (allConstraints.size > 0) {
+    parts.push(`Hard constraints: ${Array.from(allConstraints).join("; ")}.`);
+  }
+
+  if (cp?.next_actions && cp.next_actions.length > 0) {
+    parts.push(`Next action: ${cp.next_actions[0]}.`);
+  }
+
+  if (lastCompactIneffective) {
+    parts.push(
+      "Previous compaction did not effectively reduce context pressure; this summary should more aggressively discard tool output details.",
+    );
+  }
+
   return parts.join("\n");
 }
 
@@ -265,11 +362,18 @@ async function cmdStatus(ctx: ExtensionCommandContext): Promise<void> {
     model,
     config: e.config,
     pins: e.pins.active(),
+    calibrator: e.calibrator,
     tokenEstimator: (m) => estimateTokens(m as AgentMessage),
   });
   const cp = loadLatestCheckpoint(e);
   const decision = planAutomatic(
-    { analysis, state: e.state, config: e.config, model, checkpointFresh: checkpointIsFresh(e) },
+    {
+      analysis,
+      state: e.state,
+      config: e.config,
+      model,
+      checkpointFresh: checkpointIsFresh(e, analysis.totalTokens, effective.length),
+    },
     e.state,
   ).decision;
   await showPanel(
@@ -334,6 +438,7 @@ async function cmdClean(ctx: ExtensionCommandContext): Promise<void> {
     model,
     config: e.config,
     pins: e.pins.active(),
+    calibrator: e.calibrator,
     tokenEstimator: (m) => estimateTokens(m as AgentMessage),
   });
   const { toolCalls } = before.classify;
@@ -341,7 +446,8 @@ async function cmdClean(ctx: ExtensionCommandContext): Promise<void> {
     messages,
     analysis: before.analysis,
     toolCalls,
-    opts: MANUAL_PRUNE_OPTS,
+    // Manual clean always uses the most aggressive configured band (§8.1).
+    opts: getPruneOptsForPressure(before.analysis.pressure, e.config, "manual"),
   });
   if (!result.actions.length) {
     notify(ctx, "nothing to clean", "info");
@@ -382,10 +488,11 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
   const e = engine;
   if (!e) return notify(ctx, "context engine not initialized", "warning");
   // G4 (§4): a checkpoint must exist before we compact.
+  const messages = currentMessages(ctx);
   let cp = loadLatestCheckpoint(e);
-  if (!cp || !checkpointIsFresh(e)) {
+  if (!cp || !checkpointIsFresh(e, undefined, messages.length)) {
     notify(ctx, "generating checkpoint before compact…", "info");
-    const r = await runCheckpoint(e, ctx, currentMessages(ctx), "auto", (t, k) => notify(ctx, t, k));
+    const r = await runCheckpoint(e, ctx, messages, "auto", (t, k) => notify(ctx, t, k));
     if (!r.ok) {
       notify(ctx, `compact aborted — no recoverable checkpoint: ${r.text}`, "error");
       return;
@@ -395,10 +502,14 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
   notify(ctx, "compaction started (checkpoint-anchored)", "info");
   try {
     ctx.compact({
-      customInstructions: compactInstructions(cp),
-      // NOTE: do NOT count compactions here. Pi emits `session_compact` for
+      customInstructions: compactInstructions(
+        cp,
+        e.pins.active(),
+        (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
+      ),
+      // NOTE: do NOT count compactions here (D1 fix). Pi emits `session_compact` for
       // extension-triggered compactions too — the handler is the single
-      // source of truth (double-counting would corrupt the handoff gate).
+      // source of truth.
       onComplete: () => {
         try {
           e.auditor.event("compact", { triggered: "manual" });
@@ -421,11 +532,11 @@ async function cmdHandoff(ctx: ExtensionCommandContext): Promise<void> {
     notify(ctx, "handoff requires interactive mode", "warning");
     return;
   }
-  // Ensure a fresh checkpoint first (safety, spec §27).
+  const messages = currentMessages(ctx);
   let cp = loadLatestCheckpoint(e);
-  if (!cp || !checkpointIsFresh(e)) {
+  if (!cp || !checkpointIsFresh(e, undefined, messages.length)) {
     notify(ctx, "generating checkpoint before handoff…", "info");
-    const r = await runCheckpoint(e, ctx, currentMessages(ctx), "auto", (t, k) => notify(ctx, t, k));
+    const r = await runCheckpoint(e, ctx, messages, "auto", (t, k) => notify(ctx, t, k));
     if (!r.ok) {
       notify(ctx, `handoff aborted: ${r.text}`, "error");
       return;
@@ -573,7 +684,6 @@ export default function (pi: ExtensionAPI): void {
   piApi = pi;
 
   pi.on("session_start", (_event, ctx) => {
-    // Fail-open even at startup (§36): a broken config must not block the session.
     try {
       engine = createEngine(ctx);
       lastSeenMessages = [];
@@ -581,7 +691,7 @@ export default function (pi: ExtensionAPI): void {
       if (engine.config.enabled && ctx.hasUI) {
         ctx.ui.setStatus(
           ENGINE_ID,
-          `context-engine on (prune ${resolveThresholds(engine.config, toModelInfo(ctx.model)).prune})`,
+          `context-engine on (prune ${resolveThresholds(engine.config, toModelInfo(ctx.model)).prune.enter})`,
         );
       }
     } catch (err) {
@@ -595,10 +705,21 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    if (engine) {
+      try {
+        engine.auditor.flush();
+      } catch {
+        // fail-open
+      }
+    }
     engine = null;
     lastSeenMessages = [];
     lastSeenSession = null;
   });
+
+  // -------------------------------------------------------------------------
+  // Context event pipeline (spec §3: OBSERVE → DECIDE → PRUNE → REINJECT → ESCALATE)
+  // -------------------------------------------------------------------------
 
   pi.on("context", async (event, ctx) => {
     const e = engine;
@@ -608,20 +729,89 @@ export default function (pi: ExtensionAPI): void {
       lastSeenSession = { id: e.sessionId, leaf: safeLeafId(ctx) };
       const model = toModelInfo(ctx.model);
       const usage = ctx.getContextUsage();
-      const { analysis, classify } = analyzeContext({
+
+      // 1. OBSERVE: unified metering (§4), single-turn memoization (§10.2)
+      let { analysis, classify, meter } = analyzeContext({
         messages: event.messages as AnyMessage[],
         usage,
         model,
         config: e.config,
         pins: e.pins.active(),
+        calibrator: e.calibrator,
         tokenEstimator: (m) => estimateTokens(m as AgentMessage),
       });
 
-      const checkpointFresh = checkpointIsFresh(e);
+      // Check compact effectiveness from previous round (§9.1)
+      if (e.state.lastCompactPressureBefore !== undefined) {
+        const pressureBefore = e.state.lastCompactPressureBefore;
+        const pressureAfter = analysis.pressure;
+        const pressureDrop = pressureBefore - pressureAfter;
+        e.state.lastCompactPressureBefore = undefined;
+
+        if (pressureDrop < 0.05) {
+          e.state.consecutiveIneffectiveCompacts =
+            (e.state.consecutiveIneffectiveCompacts ?? 0) + 1;
+          e.auditor.event("compact_ineffective", {
+            pressureBefore,
+            pressureAfter,
+            pressureDrop,
+            consecutive: e.state.consecutiveIneffectiveCompacts,
+          });
+
+          if (
+            e.state.consecutiveIneffectiveCompacts >= 2 &&
+            e.config.policy.adaptiveThresholds
+          ) {
+            e.state.adaptiveCompactEnterDelta =
+              (e.state.adaptiveCompactEnterDelta ?? 0) + 0.04;
+            e.auditor.event("adaptive_threshold_increased", {
+              action: "compact",
+              delta: e.state.adaptiveCompactEnterDelta,
+            });
+          }
+        } else {
+          e.state.consecutiveIneffectiveCompacts = 0;
+        }
+        persistState(e);
+      }
+
+      // §6: per-turn bookkeeping — turn counter + hysteresis band tracking
+      // (a latched band resets only after 2 consecutive turns below exit).
+      e.state.turnCount = (e.state.turnCount ?? 0) + 1;
+      const bandsChanged = updateHysteresisBands(
+        e.state,
+        analysis.pressure,
+        resolveThresholds(e.config, model),
+      );
+      if (bandsChanged) persistState(e);
+
+      // Checkpoint freshness (D4, §7.1)
+      const checkpointFresh = checkpointIsFresh(
+        e,
+        analysis.totalTokens,
+        event.messages.length,
+      );
+
+      // 2. DECIDE: state machine plan with hysteresis & rate limits (§5, §6)
       let plan = planAutomatic(
         { analysis, state: e.state, config: e.config, model, checkpointFresh },
         e.state,
       );
+
+      if (plan.throttledActions?.length) {
+        for (const act of plan.throttledActions) {
+          e.auditor.event("policy_throttled", {
+            action: act,
+            pressure: analysis.pressure,
+          });
+          notify(
+            ctx,
+            `auto ${act} throttled: max per 10 turns reached`,
+            "info",
+          );
+        }
+      }
+
       const armed = Date.now() < e.cleanArmed.until;
       if (
         !plan.prune &&
@@ -630,44 +820,73 @@ export default function (pi: ExtensionAPI): void {
         !plan.compact &&
         !plan.handoffSuggest
       ) {
-        return; // fast path — no action
+        return; // fast path — no action needed
       }
 
       let messages: AnyMessage[] = event.messages as AnyMessage[];
 
-      // 1) prune
+      // 3. PRUNE: non-destructive rewrite with pressure bands (§8.1)
       if (plan.prune || armed) {
+        const pruneOpts = armed
+          ? getPruneOptsForPressure(analysis.pressure, e.config, "manual")
+          : plan.pruneOpts;
         const result = pruneContext({
           messages,
           analysis,
           toolCalls: classify.toolCalls,
-          opts: armed ? MANUAL_PRUNE_OPTS : AUTO_PRUNE_OPTS,
+          opts: pruneOpts,
         });
+
         if (result.actions.length) {
           messages = result.context;
           e.state.lastPruneAt = Date.now();
+          e.state.actionHistory = [
+            ...(e.state.actionHistory ?? []).slice(-19),
+            { action: "prune", timestamp: Date.now(), turn: e.state.turnCount },
+          ];
+          if (!armed) markBandActive(e.state, "prune"); // §6 latch (auto path only)
+
+          // Recompute analysis under exact same meter (P2, D5)
+          const analysisBefore = analysis;
+          analysis = meter.recompute(analysis, result);
+
+          // Check prune effectiveness and adaptive threshold (§6)
+          const enterThreshold = resolveThresholds(e.config, model).prune.enter;
+          if (analysis.pressure >= enterThreshold - 0.05) {
+            e.state.consecutiveIneffectivePrunes =
+              (e.state.consecutiveIneffectivePrunes ?? 0) + 1;
+            if (
+              e.state.consecutiveIneffectivePrunes >= 2 &&
+              e.config.policy.adaptiveThresholds
+            ) {
+              e.state.adaptivePruneEnterDelta =
+                (e.state.adaptivePruneEnterDelta ?? 0) + 0.05;
+              e.auditor.event("adaptive_threshold_increased", {
+                action: "prune",
+                delta: e.state.adaptivePruneEnterDelta,
+              });
+            }
+          } else {
+            e.state.consecutiveIneffectivePrunes = 0;
+          }
+
           e.auditor.prune(
             result.actions,
             armed ? "manual" : "auto",
+            analysisBefore.totalTokens,
             analysis.totalTokens,
-            Math.max(0, analysis.totalTokens - result.removedTokens),
           );
           persistState(e);
-          if (armed) e.cleanArmed = { until: 0 }; // consumed by this pass (P2)
+          if (armed) e.cleanArmed = { until: 0 };
 
-          // Recompute pressure after pruning and escalate within this event
-          // (spec §42: prune → recompute → compact). The checkpoint step is
-          // still decided by the plan (fresh checkpoint or auto-checkpoint
-          // fires below); compaction can be triggered right away if the
-          // post-prune pressure already crosses its threshold.
-          if (!plan.compact && e.config.auto.compact) {
-            const postPressure = Math.max(
-              0,
-              (analysis.totalTokens - result.removedTokens) / analysis.usableTokens,
-            );
+          // Post-prune escalation check within event (§3). Uses the
+          // recomputed (same-meter) pressure; respects the compact latch.
+          if (!plan.compact && !e.state.bandActive?.compact && e.config.auto.compact) {
             const t = resolveThresholds(e.config, model);
+            const compactEnter =
+              t.compact.enter + (e.state.adaptiveCompactEnterDelta ?? 0);
             if (
-              postPressure >= t.compact &&
+              analysis.pressure >= compactEnter &&
               Date.now() - e.state.lastCompactAt >= e.config.cooldowns.compactMs
             ) {
               plan = { ...plan, compact: true };
@@ -676,7 +895,7 @@ export default function (pi: ExtensionAPI): void {
         }
       }
 
-      // 2) re-inject pins (they must survive pruning, spec §15) — audited.
+      // 4. REINJECT: ensure pins survive (D2 fixed)
       const activePins = e.pins.active();
       if (activePins.length) {
         const ensured = ensurePinsInContext(messages, activePins);
@@ -686,24 +905,44 @@ export default function (pi: ExtensionAPI): void {
         }
       }
 
-      // 3) checkpoint (fire-and-forget; never blocks the model call)
+      // 5. ESCALATE: checkpoint, compact, handoff suggestions
       if (plan.checkpoint && !e.checkpointBusy) {
+        e.state.actionHistory = [
+          ...(e.state.actionHistory ?? []).slice(-19),
+          { action: "checkpoint", timestamp: Date.now(), turn: e.state.turnCount },
+        ];
+        markBandActive(e.state, "checkpoint");
+        persistState(e);
         void runCheckpoint(e, ctx, messages, "auto").then((r) =>
-          notify(ctx, r.ok ? r.text : `auto checkpoint failed: ${r.text}`, r.ok ? "info" : "warning"),
+          notify(
+            ctx,
+            r.ok ? r.text : `auto checkpoint failed: ${r.text}`,
+            r.ok ? "info" : "warning",
+          ),
         );
       }
 
-      // 4) compact
       if (plan.compact) {
         e.state.lastCompactAt = Date.now();
+        e.state.lastCompactPressureBefore = analysis.pressure;
+        e.state.actionHistory = [
+          ...(e.state.actionHistory ?? []).slice(-19),
+          { action: "compact", timestamp: Date.now(), turn: e.state.turnCount },
+        ];
+        markBandActive(e.state, "compact");
         persistState(e);
         e.auditor.event("compact", { triggered: "auto", pressure: analysis.pressure });
+
         ctx.compact({
-          customInstructions: compactInstructions(loadLatestCheckpoint(e)),
+          customInstructions: compactInstructions(
+            loadLatestCheckpoint(e),
+            e.pins.active(),
+            (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
+          ),
+          // D1 fix: session_compact handler is the single source of truth.
           onComplete: () => {
             try {
-              e.state.compactionCount += 1;
-              persistState(e);
+              e.auditor.event("compact_completed", { triggered: "auto" });
             } catch {
               // fail-open
             }
@@ -712,7 +951,6 @@ export default function (pi: ExtensionAPI): void {
         });
       }
 
-      // 5) handoff — SUGGEST ONLY (spec §26/§27)
       if (plan.handoffSuggest && Date.now() - e.lastHandoffSuggestAt > 10 * 60_000) {
         e.lastHandoffSuggestAt = Date.now();
         e.auditor.event("handoff_suggest", {
@@ -813,7 +1051,7 @@ export default function (pi: ExtensionAPI): void {
           case "handoff":
             await cmdHandoff(ctx);
             break;
-                  case "pin":
+          case "pin":
             await cmdPin(ctx, rest);
             break;
           case "pin-last":

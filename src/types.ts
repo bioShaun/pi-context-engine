@@ -153,6 +153,19 @@ export interface PruneResult {
   actions: PruneAction[];
 }
 
+export interface PruneOptions {
+  stubMinTokens: number;
+  foldMaxChars: number;
+  /** "auto" = policy-driven; "manual" = /context clean (more aggressive). */
+  mode: "auto" | "manual";
+}
+
+export interface PruneBand {
+  pressureGte: number;
+  stubMinTokens: number;
+  foldMaxChars: number;
+}
+
 // ---------------------------------------------------------------------------
 // Policy (spec §43)
 // ---------------------------------------------------------------------------
@@ -166,6 +179,26 @@ export interface ContextPolicyDecision {
   estimatedPressureAfter?: number;
 }
 
+export interface ThresholdPair {
+  enter: number;
+  exit: number;
+}
+
+export interface HandoffThreshold {
+  enter: number;
+}
+
+export interface AutoPlan {
+  prune: boolean;
+  pruneOpts: PruneOptions;
+  checkpoint: boolean;
+  compact: boolean;
+  handoffSuggest: boolean;
+  reason: string;
+  decision: ContextPolicyDecision;
+  throttledActions?: Array<"prune" | "checkpoint" | "compact">;
+}
+
 export interface EngineState {
   compactionCount: number;
   checkpointCount: number;
@@ -173,6 +206,42 @@ export interface EngineState {
   lastPruneAt: number;
   lastCheckpointAt: number;
   lastCompactAt: number;
+  // v0.2 state
+  lastCheckpointAttemptAt?: number;
+  checkpointFailStreak?: number;
+  checkpointCircuitBroken?: boolean;
+  checkpointDisabledReason?: string;
+  tokensAtLastCheckpoint?: number;
+  messagesAtLastCheckpoint?: number;
+  lastCompactPressureBefore?: number;
+  consecutiveIneffectiveCompacts?: number;
+  consecutiveIneffectivePrunes?: number;
+  adaptivePruneEnterDelta?: number;
+  adaptiveCompactEnterDelta?: number;
+  /** Sliding action window for §6 rate limits; `turn` enables per-10-TURN counting. */
+  actionHistory?: Array<{
+    action: "prune" | "checkpoint" | "compact";
+    timestamp: number;
+    turn?: number;
+  }>;
+  /** Context-event counter (§6 "per 10 turns" window). */
+  turnCount?: number;
+  /** §6 hysteresis latch: true while the action's band is active. Reset only
+   *  after 2 consecutive turns with pressure < exit. */
+  bandActive?: { prune: boolean; checkpoint: boolean; compact: boolean };
+  /** Consecutive turns with pressure < exit, per action (§6). */
+  lowPressureStreak?: { prune: number; checkpoint: number; compact: number };
+}
+
+// ---------------------------------------------------------------------------
+// Meter (spec §4)
+// ---------------------------------------------------------------------------
+
+export interface Meter {
+  tokens(msg: AnyMessage): number;
+  total(messages: readonly AnyMessage[]): number;
+  recompute(a: ContextAnalysis, r: PruneResult): ContextAnalysis;
+  calibrate(reported: number): void;
 }
 
 // ---------------------------------------------------------------------------

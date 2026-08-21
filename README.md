@@ -10,7 +10,7 @@ A Pi extension that manages the *effective* context sent to the model:
 - **hands off** to fresh sessions with a self-contained prompt (`/context handoff`)
 - **pins** critical constraints that survive every destructive step
 
-[中文文档](README.zh-CN.md) · [Design spec (zh)](docs/pi-context-engine.spec.md)
+[中文文档](README.zh-CN.md) · [Design spec (zh)](docs/pi-context-engine.spec.md) · [v0.2 auto-optimization spec (zh)](docs/pi-context-engine.auto-optimization.spec.md)
 
 ```
 pi native session (never modified)  ──►  context event  ──►  effective context
@@ -95,17 +95,43 @@ quality   = (critical + working tokens) / total tokens
 | pressure ≥ 94% and ≥2 compactions and quality < 50% | **suggest handoff** (never automatic) |
 
 Model-specific thresholds via config (e.g. small local models get earlier
-prune/compact). All auto behavior is individually toggleable and audited.
+prune/compact; most specific pattern wins). All auto behavior is individually
+toggleable and audited.
+
+Auto actions are anti-oscillating and cost-bounded (v0.2): each action has
+enter/exit hysteresis (re-entry requires 2 consecutive turns below `exit`),
+cooldowns (prune 15s / compact 300s), and a rate limit (≤ 3 actions per 10
+turns, then notify-only). Checkpoint generation backs off exponentially after
+failures (30s → 60s → 120s → … capped at 10min), trips a circuit breaker after
+3 consecutive failures, and has a per-session budget (`maxPerSession`). A
+checkpoint counts as fresh only when it is < 10min old AND < 20K tokens AND
+< 30 messages behind.
 
 ```json
 {
   "enabled": true,
   "auto": { "prune": true, "checkpoint": true, "compact": true },
   "handoff": { "mode": "suggest" },
-  "thresholds": { "prune": 0.65, "checkpoint": 0.80, "compact": 0.88, "handoff": 0.94 },
-  "models": { "qwen*": { "prune": 0.55, "compact": 0.78 } }
+  "thresholds": {
+    "prune":      { "enter": 0.65, "exit": 0.55 },
+    "checkpoint": { "enter": 0.80, "exit": 0.70 },
+    "compact":    { "enter": 0.88, "exit": 0.78 },
+    "handoff":    { "enter": 0.94 }
+  },
+  "policy": { "reclaimableMin": 5000, "maxActionsPer10Turns": 3, "adaptiveThresholds": true },
+  "checkpoint": { "model": null, "maxPerSession": 20 },
+  "prune": { "bands": [
+    { "pressureGte": 0.88, "stubMinTokens": 20, "foldMaxChars": 1200 },
+    { "pressureGte": 0.80, "stubMinTokens": 30, "foldMaxChars": 1600 },
+    { "pressureGte": 0.0,  "stubMinTokens": 50, "foldMaxChars": 2200 }
+  ]},
+  "models": { "qwen*": { "prune": { "enter": 0.55, "exit": 0.45 }, "compact": { "enter": 0.78, "exit": 0.68 } } }
 }
 ```
+
+v0.1 flat thresholds (`"prune": 0.65`) still load — they are migrated to
+`{ enter, exit: enter − 0.10 }` automatically (audited as `config_migrated`).
+Invalid values fall back to defaults (`config_sanitized`).
 
 ## What gets pruned
 
@@ -154,7 +180,9 @@ Layout follows the spec's recommended source structure (`src/observer`,
 
 ## Roadmap (spec §47–49)
 
-- v0.2: automatic checkpoint refresh, Pi compaction hook integration, better
-  test-result folding, git-aware diff tracking, task phase detection
+- v0.2 (done): auto-first pipeline — unified token metering (CJK-aware +
+  calibrated), enter/exit hysteresis with rate limits, checkpoint backoff /
+  circuit breaker / budget, pressure-banded pruning, range-aware read
+  supersession
 - v0.3: handoff scoring, automatic fresh-session bootstrap, checkpoint recovery
 - v0.4: semantic folding (embeddings / recall on demand)

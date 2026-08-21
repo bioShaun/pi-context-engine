@@ -18,6 +18,7 @@ import {
   readFileSync,
   readdirSync,
   writeFileSync,
+  appendFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { Checkpoint } from "../types.ts";
@@ -30,6 +31,9 @@ export class SessionStore {
   readonly pinsFile: string;
   readonly metricsFile: string;
   readonly pruneLogFile: string;
+
+  private buffer: Array<{ file: "metrics" | "prune-log"; line: string }> = [];
+  private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(stateDir: string, sessionId: string) {
     this.root = stateDir;
@@ -75,19 +79,63 @@ export class SessionStore {
     writeFileSync(this.pinsFile, JSON.stringify({ pins }, null, 2));
   }
 
-  // ---- jsonl logs ---------------------------------------------------------
+  // ---- jsonl logs (spec §10.3 batched async flush) -------------------------
 
   appendJsonl(file: "metrics" | "prune-log", obj: unknown): void {
-    this.ensure();
-    const path = file === "metrics" ? this.metricsFile : this.pruneLogFile;
-    writeFileSync(path, JSON.stringify(obj) + "\n", { flag: "a" });
+    try {
+      const line = JSON.stringify(obj) + "\n";
+      this.buffer.push({ file, line });
+      if (this.buffer.length >= 50) {
+        this.flush();
+      } else if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = null;
+          this.flush();
+        }, 5000);
+        if (typeof this.flushTimer.unref === "function") {
+          this.flushTimer.unref();
+        }
+      }
+    } catch {
+      // fail-open
+    }
+  }
+
+  flush(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.buffer.length === 0) return;
+    const items = [...this.buffer];
+    this.buffer = [];
+    try {
+      this.ensure();
+      const metricsLines = items
+        .filter((x) => x.file === "metrics")
+        .map((x) => x.line)
+        .join("");
+      const pruneLines = items
+        .filter((x) => x.file === "prune-log")
+        .map((x) => x.line)
+        .join("");
+      if (metricsLines) {
+        appendFileSync(this.metricsFile, metricsLines);
+      }
+      if (pruneLines) {
+        appendFileSync(this.pruneLogFile, pruneLines);
+      }
+    } catch {
+      // fail-open: drop if failed, don't crash
+    }
   }
 
   readJsonl(file: "metrics" | "prune-log"): unknown[] {
+    this.flush();
     try {
-      const lines = readFileSync(file === "metrics" ? this.metricsFile : this.pruneLogFile, "utf8")
-        .split("\n")
-        .filter(Boolean);
+      const path = file === "metrics" ? this.metricsFile : this.pruneLogFile;
+      if (!existsSync(path)) return [];
+      const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
       return lines.map((l) => JSON.parse(l));
     } catch {
       return [];
