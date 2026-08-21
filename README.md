@@ -10,6 +10,8 @@ A Pi extension that manages the *effective* context sent to the model:
 - **hands off** to fresh sessions with a self-contained prompt (`/context handoff`)
 - **pins** critical constraints that survive every destructive step
 
+[中文文档](README.zh-CN.md) · [Design spec (zh)](docs/pi-context-engine.spec.md)
+
 ```
 pi native session (never modified)  ──►  context event  ──►  effective context
                                                         (pruned, folded,
@@ -21,12 +23,28 @@ pi native session (never modified)  ──►  context event  ──►  effecti
 ## Install
 
 ```bash
-pi install /path/to/pi-context-engine        # or add to settings.json "packages"
-# quick test:
-pi -e ./src/index.ts
+# from GitHub (global install → ~/.pi/agent/settings.json)
+pi install git:github.com/bioShaun/pi-context-engine
+
+# project-local (→ .pi/settings.json, shareable with your team)
+pi install -l git:github.com/bioShaun/pi-context-engine
+
+# try it for this run only, without installing
+pi -e git:github.com/bioShaun/pi-context-engine
 ```
 
-No runtime dependencies. State is stored session-locally (never touches your repo):
+- SSH source works too: `pi install git:git@github.com:bioShaun/pi-context-engine`
+  (uses your configured SSH keys / `~/.ssh/config`).
+- Local development: `pi install /abs/path/to/pi-context-engine` or `pi -e ./src/index.ts`.
+
+Git installs clone the repo and run `npm install` automatically (the Pi core
+packages are declared as peers and provided by Pi itself — the extension has no
+runtime dependencies of its own).
+
+Uninstall: `pi remove git:github.com/bioShaun/pi-context-engine`.
+`pi list` shows installed packages; `pi update --extensions` updates them.
+
+State is stored session-locally (never touches your repo):
 
 ```
 ~/.pi/context-engine/
