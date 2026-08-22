@@ -61,6 +61,21 @@ interface Engine {
   /** Manual /context clean is armed: next context pass prunes aggressively. */
   cleanArmed: { until: number };
   checkpointBusy: boolean;
+  /**
+   * In-flight ctx.compact(). Pi core's AgentSession.compact() has no
+   * reentrancy guard: two concurrent calls race on the shared
+   * `_compactionAbortController` and the loser crashes with "Cannot read
+   * properties of undefined (reading 'signal')". The extension must never
+   * start a second compact while one is running.
+   */
+  compactBusy: boolean;
+  /**
+   * Independent abort handle for the in-flight checkpoint LLM call. NOT
+   * ctx.signal: ctx.compact() legitimately aborts the shared session signal
+   * (AgentSession.compact() awaits this.abort()), and that must not kill a
+   * running checkpoint (the cross-event case of the G4 hazard).
+   */
+  checkpointAbort: AbortController | null;
   lastHandoffSuggestAt: number;
 }
 
@@ -120,6 +135,8 @@ function createEngine(ctx: ExtensionContext): Engine {
     calibrator,
     cleanArmed: { until: 0 },
     checkpointBusy: false,
+    compactBusy: false,
+    checkpointAbort: null,
     lastHandoffSuggestAt: 0,
   };
 }
@@ -173,6 +190,9 @@ async function runCheckpoint(
     return { ok: false, text: "no model available for checkpoint generation" };
   }
   e.checkpointBusy = true;
+  // Own AbortController, not ctx.signal — see Engine.checkpointAbort.
+  const checkpointAbort = new AbortController();
+  e.checkpointAbort = checkpointAbort;
   e.state.lastCheckpointAttemptAt = Date.now();
   persistState(e);
 
@@ -185,7 +205,7 @@ async function runCheckpoint(
       {
         messages,
         complete: buildComplete({ ...ctx, model: targetModel }),
-        signal: ctx.signal,
+        signal: checkpointAbort.signal,
         sessionId: e.sessionId,
         tokensBefore: ctx.getContextUsage()?.tokens ?? undefined,
         source,
@@ -249,6 +269,7 @@ async function runCheckpoint(
     return { ok: false, text: `checkpoint error: ${String(err)}` };
   } finally {
     e.checkpointBusy = false;
+    if (e.checkpointAbort === checkpointAbort) e.checkpointAbort = null;
   }
 }
 
@@ -535,6 +556,9 @@ async function cmdCheckpoint(ctx: ExtensionCommandContext): Promise<void> {
 async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
   const e = engine;
   if (!e) return notify(ctx, "context engine not initialized", "warning");
+  if (e.compactBusy) {
+    return notify(ctx, "compaction already in progress", "warning");
+  }
   // G4 (§4): a checkpoint must exist before we compact.
   const messages = currentMessages(ctx);
   let cp = loadLatestCheckpoint(e);
@@ -549,6 +573,7 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
   }
   notify(ctx, "compaction started (checkpoint-anchored)", "info");
   setTransientStatus(ctx, "ctx: compacting…", 0);
+  e.compactBusy = true;
   try {
     ctx.compact({
       customInstructions: compactInstructions(
@@ -560,6 +585,7 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
       // extension-triggered compactions too — the handler is the single
       // source of truth.
       onComplete: () => {
+        e.compactBusy = false;
         try {
           e.auditor.event("compact", { triggered: "manual" });
           setTransientStatus(ctx, "ctx: compacted", 3500);
@@ -569,11 +595,13 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
         }
       },
       onError: (err) => {
+        e.compactBusy = false;
         setTransientStatus(ctx, "ctx: compact failed", 3500);
         notify(ctx, `compaction failed: ${err.message}`, "error");
       },
     });
   } catch (err) {
+    e.compactBusy = false;
     setTransientStatus(ctx, "ctx: compact failed", 3500);
     notify(ctx, `compaction could not start: ${String(err)}`, "error");
   }
@@ -755,6 +783,11 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", () => {
     if (engine) {
+      try {
+        engine.checkpointAbort?.abort();
+      } catch {
+        // fail-open
+      }
       try {
         engine.auditor.flush();
       } catch {
@@ -962,11 +995,30 @@ export default function (pi: ExtensionAPI): void {
       // G4 (§4): a checkpoint must exist before we compact. When both are
       // planned, the checkpoint runs to completion FIRST and compaction is
       // chained after it. Firing them concurrently lets ctx.compact()'s
-      // abort() kill the in-flight checkpoint LLM call (it shares the
-      // session abort signal), which surfaces as "checkpoint must be a JSON
-      // object" and leaves the compaction unanchored.
+      // abort() kill the in-flight checkpoint LLM call and leaves the
+      // compaction unanchored. Two defenses make this hold across separate
+      // context events as well: startAutoCompact re-checks the
+      // compactBusy/checkpointBusy in-flight guards at call time (plan is a
+      // stale closure in the chained path), and the checkpoint LLM call runs
+      // on its own AbortController instead of the shared session signal.
       const startAutoCompact = (): void => {
         if (!plan.compact) return;
+        // Re-check in-flight state at call time, not plan time: `plan` is a
+        // stale closure when this runs chained after a checkpoint settles.
+        // Never start a second compact while one is running (pi core races,
+        // see Engine.compactBusy), and never run compact concurrently with a
+        // checkpoint — ctx.compact()'s mandatory abort() would kill it (G4).
+        // When a checkpoint is settling, its own completion chain fires the
+        // compact; otherwise the next context event re-plans it. Neither
+        // lastCompactAt nor the hysteresis band is touched on a skip, so
+        // re-planning is not throttled.
+        if (e.compactBusy || e.checkpointBusy) {
+          e.auditor.event("compact_skipped", {
+            reason: e.compactBusy ? "already_in_flight" : "checkpoint_in_flight",
+            pressure: analysis.pressure,
+          });
+          return;
+        }
         setTransientStatus(ctx, "ctx: compacting…", 0);
         e.state.lastCompactAt = Date.now();
         e.state.lastCompactPressureBefore = analysis.pressure;
@@ -983,26 +1035,35 @@ export default function (pi: ExtensionAPI): void {
           anchored: cp !== null,
         });
 
-        ctx.compact({
-          customInstructions: compactInstructions(
-            cp,
-            e.pins.active(),
-            (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
-          ),
-          // D1 fix: session_compact handler is the single source of truth.
-          onComplete: () => {
-            try {
-              e.auditor.event("compact_completed", { triggered: "auto" });
-              setTransientStatus(ctx, "ctx: compacted", 3500);
-            } catch {
-              // fail-open
-            }
-          },
-          onError: (err) => {
-            setTransientStatus(ctx, "ctx: compact failed", 3500);
-            notify(ctx, `auto compaction failed: ${err.message}`, "error");
-          },
-        });
+        e.compactBusy = true;
+        try {
+          ctx.compact({
+            customInstructions: compactInstructions(
+              cp,
+              e.pins.active(),
+              (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
+            ),
+            // D1 fix: session_compact handler is the single source of truth.
+            onComplete: () => {
+              e.compactBusy = false;
+              try {
+                e.auditor.event("compact_completed", { triggered: "auto" });
+                setTransientStatus(ctx, "ctx: compacted", 3500);
+              } catch {
+                // fail-open
+              }
+            },
+            onError: (err) => {
+              e.compactBusy = false;
+              setTransientStatus(ctx, "ctx: compact failed", 3500);
+              notify(ctx, `auto compaction failed: ${err.message}`, "error");
+            },
+          });
+        } catch (err) {
+          e.compactBusy = false;
+          setTransientStatus(ctx, "ctx: compact failed", 3500);
+          notify(ctx, `auto compaction could not start: ${String(err)}`, "error");
+        }
       };
 
       if (plan.checkpoint && !e.checkpointBusy) {
@@ -1092,6 +1153,9 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_compact", (_event, ctx) => {
     const e = engine;
     if (!e) return;
+    // Defensive: a successful compaction always clears the in-flight flag,
+    // even if the ctx.compact() onComplete callback was somehow lost.
+    e.compactBusy = false;
     try {
       e.state.compactionCount += 1;
       persistState(e);

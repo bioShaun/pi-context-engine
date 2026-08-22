@@ -347,6 +347,231 @@ test("T7 (G4 race): auto compact waits for the checkpoint to settle", async () =
   }
 });
 
+test("T8 (concurrency): one compact in flight; checkpoint survives session abort", async () => {
+  const { mkdtempSync, writeFileSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  // Reproduces the 2026-08-22 incident: two context events in the same turn
+  // each reached ctx.compact() 2ms apart (one direct via the else branch while
+  // checkpointBusy, one chained after the checkpoint failed). Pi core's
+  // AgentSession.compact() has no reentrancy guard, so the two calls raced on
+  // the shared _compactionAbortController and the loser crashed with
+  // "Cannot read properties of undefined (reading 'signal')". The direct
+  // compact's abort() also killed the in-flight checkpoint, which used to run
+  // on the shared session signal.
+  type CompactOpts = {
+    customInstructions?: string;
+    onComplete?: () => void;
+    onError?: (err: Error) => void;
+  };
+  type CompleteOpts = { signal?: AbortSignal };
+
+  const VALID_CP = JSON.stringify({
+    version: 1,
+    created_at: new Date().toISOString(),
+    task: { goal: "migrate the database safely", phase: "p", status: "in_progress" },
+    requirements: [],
+    constraints: ["never drop the prod table"],
+    decisions: [],
+    files: { inspected: [], modified: [], created: [], deleted: [] },
+    verification: { passed: [], failed: [], pending: [] },
+    issues: [],
+    next_actions: ["run the migration dry-run"],
+  });
+
+  const setup = async (
+    sessionId: string,
+    complete: (opts?: CompleteOpts) => Promise<unknown>,
+  ) => {
+    const tmp = mkdtempSync(join(tmpdir(), "pce-t8-"));
+    const stateDir = join(tmp, "state");
+    const cfgPath = join(tmp, "config.json");
+    // Same inverted band as T7: compact.enter 0.80 < checkpoint.enter 0.86,
+    // so pressure ~0.82 plans BOTH checkpoint and compact.
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        enabled: true,
+        stateDir,
+        auto: { prune: true, checkpoint: true, compact: true },
+        thresholds: {
+          prune: { enter: 0.65, exit: 0.55 },
+          checkpoint: { enter: 0.86, exit: 0.70 },
+          compact: { enter: 0.80, exit: 0.70 },
+          handoff: { enter: 0.94 },
+        },
+        policy: DEFAULT_CONFIG.policy,
+        checkpoint: { ...DEFAULT_CONFIG.checkpoint, model: null },
+      }),
+    );
+    process.env.PI_CONTEXT_ENGINE_CONFIG = cfgPath;
+
+    const { default: extensionFactory } = await import("../src/index.ts");
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      on: (ev: string, fn: (event: unknown, ctx: unknown) => unknown) => void handlers.set(ev, fn),
+      registerCommand: () => {},
+      exec: async () => ({ stdout: "", stderr: "", code: 0 }),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    extensionFactory(pi as any);
+
+    const compactCalls: CompactOpts[] = [];
+    const sessionAbort = new AbortController();
+    const usage = { tokens: 72_000, contextWindow: 100_000, percent: 72 };
+    const ctx = {
+      cwd: tmp,
+      hasUI: true,
+      mode: "print",
+      model: { provider: "test", id: "test-model", contextWindow: 100_000, maxTokens: 8192 },
+      modelRegistry: {
+        complete: (_model: unknown, _params: unknown, opts?: CompleteOpts) => complete(opts),
+      },
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getBranch: () => [],
+        getLeafId: () => "leaf-1",
+        buildContextEntries: () => [],
+        getSessionFile: () => join(tmp, "session.jsonl"),
+      },
+      getContextUsage: () => usage,
+      signal: sessionAbort.signal,
+      ui: { notify: () => {}, setStatus: () => {} },
+      compact: (opts: CompactOpts) => {
+        compactCalls.push(opts);
+        opts.onComplete?.();
+      },
+    };
+    return {
+      handlers,
+      ctx,
+      compactCalls,
+      sessionAbort,
+      stateFile: join(stateDir, "sessions", sessionId, "state.json"),
+      cleanup: async () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await handlers.get("session_shutdown")?.({}, ctx as any);
+        delete process.env.PI_CONTEXT_ENGINE_CONFIG;
+      },
+    };
+  };
+
+  const waitFor = async (pred: () => boolean, ms = 2000): Promise<void> => {
+    for (let i = 0; i < ms / 10 && !pred(); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+  const readState = (
+    file: string,
+  ): { checkpointCount?: number; checkpointFailStreak?: number } => {
+    try {
+      return JSON.parse(readFileSync(file, "utf8")).state ?? {};
+    } catch {
+      return {};
+    }
+  };
+
+  // Scenario A: two context events in one turn -> exactly one compact, fired
+  // once, chained after the checkpoint, and the checkpoint is not aborted.
+  {
+    const capturedSignals: Array<AbortSignal | undefined> = [];
+    const s = await setup("t8a-session", async (opts) => {
+      capturedSignals.push(opts?.signal);
+      await new Promise((r) => setTimeout(r, 30)); // simulate LLM latency
+      return { stopReason: "stop", content: [{ type: "text", text: VALID_CP }] };
+    });
+    try {
+      const messages = [userMsg("do the task"), assistantText("working on it")];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("session_start")?.({}, s.ctx as any);
+      // Event 1: plans checkpoint + compact; checkpoint starts (in flight),
+      // compact is chained after it (G4).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("context")?.({ messages }, s.ctx as any);
+      // Event 2, same turn (2ms later in the incident): checkpoint still in
+      // flight. Pre-fix this fired a second ctx.compact() whose abort() killed
+      // the checkpoint; the post-checkpoint chain then fired a third compact
+      // and the two raced inside pi core.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("context")?.({ messages }, s.ctx as any);
+      assert.equal(
+        s.compactCalls.length,
+        0,
+        "no compact may start while the checkpoint is in flight",
+      );
+
+      await waitFor(() => (readState(s.stateFile).checkpointCount ?? 0) >= 1);
+      assert.equal(
+        readState(s.stateFile).checkpointCount ?? 0,
+        1,
+        "checkpoint must complete (not aborted by a concurrent compact)",
+      );
+      assert.equal(readState(s.stateFile).checkpointFailStreak ?? 0, 0);
+      await waitFor(() => s.compactCalls.length >= 1);
+      assert.equal(
+        s.compactCalls.length,
+        1,
+        "exactly one compact fires, chained after the checkpoint settles",
+      );
+      assert.ok(
+        (s.compactCalls[0]?.customInstructions ?? "").includes("never drop the prod table"),
+        "the chained compact is anchored by the fresh checkpoint",
+      );
+      assert.ok(capturedSignals.length >= 1, "checkpoint LLM call captured");
+      assert.notEqual(
+        capturedSignals[0],
+        s.ctx.signal,
+        "checkpoint must not run on the shared session abort signal",
+      );
+    } finally {
+      await s.cleanup();
+    }
+  }
+
+  // Scenario B: a pi-side session abort (user Esc, or pi's own compact())
+  // lands while a checkpoint LLM call is in flight. The checkpoint runs on
+  // its own AbortController, so it still completes.
+  {
+    const capturedSignals: Array<AbortSignal | undefined> = [];
+    const s = await setup("t8b-session", async (opts) => {
+      capturedSignals.push(opts?.signal);
+      await new Promise((r) => setTimeout(r, 50));
+      if (opts?.signal?.aborted) {
+        // providers honor the abort signal, surfacing stopReason "aborted"
+        return { stopReason: "aborted", content: [] };
+      }
+      return { stopReason: "stop", content: [{ type: "text", text: VALID_CP }] };
+    });
+    try {
+      const messages = [userMsg("do the task"), assistantText("working on it")];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("session_start")?.({}, s.ctx as any);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("context")?.({ messages }, s.ctx as any);
+      // Abort the shared session signal mid-checkpoint (Esc / pi compact()).
+      s.sessionAbort.abort();
+
+      await waitFor(() => (readState(s.stateFile).checkpointCount ?? 0) >= 1);
+      assert.equal(
+        readState(s.stateFile).checkpointCount ?? 0,
+        1,
+        "checkpoint survives a session-level abort",
+      );
+      assert.equal(readState(s.stateFile).checkpointFailStreak ?? 0, 0);
+      assert.ok(
+        capturedSignals[0] && !capturedSignals[0].aborted,
+        "the checkpoint's own signal is unaffected by the session abort",
+      );
+      // Pressure relief still chains the compact afterwards.
+      await waitFor(() => s.compactCalls.length >= 1);
+      assert.equal(s.compactCalls.length, 1);
+    } finally {
+      await s.cleanup();
+    }
+  }
+});
+
 test("T2 (D2): Pin matching case normalization", () => {
   // Case A: text pin "CRITICAL_PATH" matched against lowercase text in message
   const textPin: Pin = {
