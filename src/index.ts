@@ -1078,8 +1078,8 @@ export default function (pi: ExtensionAPI): void {
       if (!transientStatusTimer && ctx.hasUI && usage?.percent != null) {
         const model = toModelInfo(ctx.model);
         const thresholds = resolveThresholds(e.config, model);
-        if (usage.percent >= thresholds.checkpoint.enter) {
-          ctx.ui.setStatus(ENGINE_ID, `ctx: ${Math.round(usage.percent * 100)}%`);
+        if (usage.percent / 100 >= thresholds.checkpoint.enter) {
+          ctx.ui.setStatus(ENGINE_ID, `ctx: ${Math.round(usage.percent)}%`);
         } else {
           ctx.ui.setStatus(ENGINE_ID, undefined);
         }
