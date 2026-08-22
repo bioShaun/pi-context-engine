@@ -344,6 +344,51 @@ function notify(ctx: ExtensionContext, text: string, kind: "info" | "warning" | 
   }
 }
 
+let transientStatusTimer: ReturnType<typeof setTimeout> | null = null;
+
+function setTransientStatus(
+  ctx: { hasUI?: boolean; ui?: { setStatus: (id: string, text: string | undefined) => void } },
+  text: string,
+  durationMs = 3500,
+): void {
+  if (!ctx.hasUI || !ctx.ui) return;
+  if (transientStatusTimer) {
+    clearTimeout(transientStatusTimer);
+    transientStatusTimer = null;
+  }
+  try {
+    ctx.ui.setStatus(ENGINE_ID, text);
+  } catch {
+    // fail-open
+  }
+  if (durationMs > 0) {
+    transientStatusTimer = setTimeout(() => {
+      try {
+        ctx.ui?.setStatus(ENGINE_ID, undefined);
+      } catch {
+        // fail-open
+      }
+      transientStatusTimer = null;
+    }, durationMs);
+  }
+}
+
+function clearTransientStatus(
+  ctx?: { hasUI?: boolean; ui?: { setStatus: (id: string, text: string | undefined) => void } },
+): void {
+  if (transientStatusTimer) {
+    clearTimeout(transientStatusTimer);
+    transientStatusTimer = null;
+  }
+  if (ctx?.hasUI && ctx.ui) {
+    try {
+      ctx.ui.setStatus(ENGINE_ID, undefined);
+    } catch {
+      // fail-open
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
@@ -457,6 +502,7 @@ async function cmdClean(ctx: ExtensionCommandContext): Promise<void> {
   e.cleanArmed = { until: Date.now() + 15 * 60_000 };
   e.auditor.prune(result.actions, "manual", before.analysis.totalTokens, afterTokens);
   persistState(e);
+  setTransientStatus(ctx, `ctx: -${fmtK(result.removedTokens)}`, 3500);
   const after = {
     ...before.analysis,
     totalTokens: afterTokens,
@@ -476,7 +522,9 @@ async function cmdCheckpoint(ctx: ExtensionCommandContext): Promise<void> {
   if (!e) return notify(ctx, "context engine not initialized", "warning");
   const messages = currentMessages(ctx);
   notify(ctx, "generating checkpoint…", "info");
+  setTransientStatus(ctx, "ctx: checkpointing…", 0);
   const r = await runCheckpoint(e, ctx, messages, "manual", (t, k) => notify(ctx, t, k));
+  setTransientStatus(ctx, r.ok ? "ctx: cp saved" : "ctx: cp failed", 3500);
   if (ctx.mode === "tui") {
     await (ctx as ExtensionCommandContext).ui.editor("Review checkpoint report", r.text);
   } else {
@@ -500,6 +548,7 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
     cp = loadLatestCheckpoint(e);
   }
   notify(ctx, "compaction started (checkpoint-anchored)", "info");
+  setTransientStatus(ctx, "ctx: compacting…", 0);
   try {
     ctx.compact({
       customInstructions: compactInstructions(
@@ -513,14 +562,19 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
       onComplete: () => {
         try {
           e.auditor.event("compact", { triggered: "manual" });
+          setTransientStatus(ctx, "ctx: compacted", 3500);
           notify(ctx, "compaction completed", "info");
         } catch {
           // fail-open
         }
       },
-      onError: (err) => notify(ctx, `compaction failed: ${err.message}`, "error"),
+      onError: (err) => {
+        setTransientStatus(ctx, "ctx: compact failed", 3500);
+        notify(ctx, `compaction failed: ${err.message}`, "error");
+      },
     });
   } catch (err) {
+    setTransientStatus(ctx, "ctx: compact failed", 3500);
     notify(ctx, `compaction could not start: ${String(err)}`, "error");
   }
 }
@@ -688,12 +742,7 @@ export default function (pi: ExtensionAPI): void {
       engine = createEngine(ctx);
       lastSeenMessages = [];
       lastSeenSession = null;
-      if (engine.config.enabled && ctx.hasUI) {
-        ctx.ui.setStatus(
-          ENGINE_ID,
-          `context-engine on (prune ${resolveThresholds(engine.config, toModelInfo(ctx.model)).prune.enter})`,
-        );
-      }
+      clearTransientStatus(ctx);
     } catch (err) {
       engine = null;
       try {
@@ -715,6 +764,7 @@ export default function (pi: ExtensionAPI): void {
     engine = null;
     lastSeenMessages = [];
     lastSeenSession = null;
+    clearTransientStatus();
   });
 
   // -------------------------------------------------------------------------
@@ -849,6 +899,8 @@ export default function (pi: ExtensionAPI): void {
           // Recompute analysis under exact same meter (P2, D5)
           const analysisBefore = analysis;
           analysis = meter.recompute(analysis, result);
+          const saved = Math.max(0, analysisBefore.totalTokens - analysis.totalTokens);
+          setTransientStatus(ctx, `ctx: -${fmtK(saved)}`, 3500);
 
           // Check prune effectiveness and adaptive threshold (§6)
           const enterThreshold = resolveThresholds(e.config, model).prune.enter;
@@ -915,6 +967,7 @@ export default function (pi: ExtensionAPI): void {
       // object" and leaves the compaction unanchored.
       const startAutoCompact = (): void => {
         if (!plan.compact) return;
+        setTransientStatus(ctx, "ctx: compacting…", 0);
         e.state.lastCompactAt = Date.now();
         e.state.lastCompactPressureBefore = analysis.pressure;
         e.state.actionHistory = [
@@ -940,15 +993,20 @@ export default function (pi: ExtensionAPI): void {
           onComplete: () => {
             try {
               e.auditor.event("compact_completed", { triggered: "auto" });
+              setTransientStatus(ctx, "ctx: compacted", 3500);
             } catch {
               // fail-open
             }
           },
-          onError: (err) => notify(ctx, `auto compaction failed: ${err.message}`, "error"),
+          onError: (err) => {
+            setTransientStatus(ctx, "ctx: compact failed", 3500);
+            notify(ctx, `auto compaction failed: ${err.message}`, "error");
+          },
         });
       };
 
       if (plan.checkpoint && !e.checkpointBusy) {
+        setTransientStatus(ctx, "ctx: checkpointing…", 0);
         e.state.actionHistory = [
           ...(e.state.actionHistory ?? []).slice(-19),
           { action: "checkpoint", timestamp: Date.now(), turn: e.state.turnCount },
@@ -956,6 +1014,7 @@ export default function (pi: ExtensionAPI): void {
         markBandActive(e.state, "checkpoint");
         persistState(e);
         void runCheckpoint(e, ctx, messages, "auto").then((r) => {
+          setTransientStatus(ctx, r.ok ? "ctx: cp saved" : "ctx: cp failed", 3000);
           notify(
             ctx,
             r.ok ? r.text : `auto checkpoint failed: ${r.text}`,
@@ -984,6 +1043,16 @@ export default function (pi: ExtensionAPI): void {
         );
       }
 
+      // High pressure display (only if no transient action is actively showing)
+      if (!transientStatusTimer && ctx.hasUI) {
+        const thresholds = resolveThresholds(e.config, model);
+        if (analysis.pressure >= thresholds.checkpoint.enter) {
+          ctx.ui.setStatus(ENGINE_ID, `ctx: ${Math.round(analysis.pressure * 100)}%`);
+        } else {
+          ctx.ui.setStatus(ENGINE_ID, undefined);
+        }
+      }
+
       if (messages !== (event.messages as AnyMessage[])) {
         return { messages: messages as unknown as AgentMessage[] };
       }
@@ -1005,6 +1074,15 @@ export default function (pi: ExtensionAPI): void {
           compactions: e.state.compactionCount,
           checkpoints: e.state.checkpointCount,
         });
+      }
+      if (!transientStatusTimer && ctx.hasUI && usage?.percent != null) {
+        const model = toModelInfo(ctx.model);
+        const thresholds = resolveThresholds(e.config, model);
+        if (usage.percent >= thresholds.checkpoint.enter) {
+          ctx.ui.setStatus(ENGINE_ID, `ctx: ${Math.round(usage.percent * 100)}%`);
+        } else {
+          ctx.ui.setStatus(ENGINE_ID, undefined);
+        }
       }
     } catch {
       // fail-open
