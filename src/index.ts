@@ -76,6 +76,19 @@ interface Engine {
    * running checkpoint (the cross-event case of the G4 hazard).
    */
   checkpointAbort: AbortController | null;
+  /**
+   * Auto compact requested by the policy but not yet fired. ctx.compact()
+   * starts with abort(), so firing mid-run kills the in-flight turn
+   * ("Operation aborted"). The request is queued in the context event and
+   * fired from agent_end (or the checkpoint chain once the run is idle),
+   * matching pi's own auto-compaction timing.
+   */
+  compactPending: { pressure: number } | null;
+  /**
+   * True while an agent run is active. Set in the context event (only fires
+   * mid-run), cleared on agent_end. Gates tryFirePendingCompact.
+   */
+  agentRunning: boolean;
   lastHandoffSuggestAt: number;
 }
 
@@ -137,6 +150,8 @@ function createEngine(ctx: ExtensionContext): Engine {
     checkpointBusy: false,
     compactBusy: false,
     checkpointAbort: null,
+    compactPending: null,
+    agentRunning: false,
     lastHandoffSuggestAt: 0,
   };
 }
@@ -270,6 +285,73 @@ async function runCheckpoint(
   } finally {
     e.checkpointBusy = false;
     if (e.checkpointAbort === checkpointAbort) e.checkpointAbort = null;
+  }
+}
+
+/**
+ * Fire the queued auto compact — but only once the agent run is idle and no
+ * checkpoint or compact is in flight. ctx.compact() begins with abort(), so
+ * firing mid-run kills the in-flight turn; deferring to agent_end matches
+ * pi's own auto-compaction timing (which also compacts between runs).
+ *
+ * Called from the agent_end handler and from the checkpoint completion
+ * chain: when the run ends while a checkpoint is still generating, agent_end
+ * skips (checkpointBusy) and the chain becomes the only firing path. The
+ * chain runs with runCheckpoint's finally already executed, so checkpointBusy
+ * is clear and the fresh checkpoint anchors the compaction (G4).
+ */
+function tryFirePendingCompact(ctx: ExtensionContext): void {
+  const e = engine;
+  if (!e || !e.compactPending || e.compactBusy || e.checkpointBusy || e.agentRunning) {
+    return;
+  }
+  const { pressure } = e.compactPending;
+  e.compactPending = null;
+
+  setTransientStatus(ctx, "ctx: compacting…", 0);
+  e.state.lastCompactAt = Date.now();
+  e.state.lastCompactPressureBefore = pressure;
+  e.state.actionHistory = [
+    ...(e.state.actionHistory ?? []).slice(-19),
+    { action: "compact", timestamp: Date.now(), turn: e.state.turnCount },
+  ];
+  markBandActive(e.state, "compact");
+  persistState(e);
+  const cp = loadLatestCheckpoint(e);
+  e.auditor.event("compact", {
+    triggered: "auto",
+    pressure,
+    anchored: cp !== null,
+  });
+
+  e.compactBusy = true;
+  try {
+    ctx.compact({
+      customInstructions: compactInstructions(
+        cp,
+        e.pins.active(),
+        (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
+      ),
+      // D1 fix: session_compact handler is the single source of truth.
+      onComplete: () => {
+        e.compactBusy = false;
+        try {
+          e.auditor.event("compact_completed", { triggered: "auto" });
+          setTransientStatus(ctx, "ctx: compacted", 3500);
+        } catch {
+          // fail-open
+        }
+      },
+      onError: (err) => {
+        e.compactBusy = false;
+        setTransientStatus(ctx, "ctx: compact failed", 3500);
+        notify(ctx, `auto compaction failed: ${err.message}`, "error");
+      },
+    });
+  } catch (err) {
+    e.compactBusy = false;
+    setTransientStatus(ctx, "ctx: compact failed", 3500);
+    notify(ctx, `auto compaction could not start: ${String(err)}`, "error");
   }
 }
 
@@ -573,6 +655,8 @@ async function cmdCompact(ctx: ExtensionCommandContext): Promise<void> {
   }
   notify(ctx, "compaction started (checkpoint-anchored)", "info");
   setTransientStatus(ctx, "ctx: compacting…", 0);
+  // A manual compact satisfies any queued auto request.
+  e.compactPending = null;
   e.compactBusy = true;
   try {
     ctx.compact({
@@ -807,6 +891,8 @@ export default function (pi: ExtensionAPI): void {
   pi.on("context", async (event, ctx) => {
     const e = engine;
     if (!e || !e.config.enabled) return;
+    // The context event only fires before an LLM call, i.e. mid-run.
+    e.agentRunning = true;
     try {
       lastSeenMessages = event.messages as AnyMessage[];
       lastSeenSession = { id: e.sessionId, leaf: safeLeafId(ctx) };
@@ -993,77 +1079,27 @@ export default function (pi: ExtensionAPI): void {
       // 5. ESCALATE: checkpoint, compact, handoff suggestions
       //
       // G4 (§4): a checkpoint must exist before we compact. When both are
-      // planned, the checkpoint runs to completion FIRST and compaction is
-      // chained after it. Firing them concurrently lets ctx.compact()'s
-      // abort() kill the in-flight checkpoint LLM call and leaves the
-      // compaction unanchored. Two defenses make this hold across separate
-      // context events as well: startAutoCompact re-checks the
-      // compactBusy/checkpointBusy in-flight guards at call time (plan is a
-      // stale closure in the chained path), and the checkpoint LLM call runs
-      // on its own AbortController instead of the shared session signal.
-      const startAutoCompact = (): void => {
-        if (!plan.compact) return;
-        // Re-check in-flight state at call time, not plan time: `plan` is a
-        // stale closure when this runs chained after a checkpoint settles.
-        // Never start a second compact while one is running (pi core races,
-        // see Engine.compactBusy), and never run compact concurrently with a
-        // checkpoint — ctx.compact()'s mandatory abort() would kill it (G4).
-        // When a checkpoint is settling, its own completion chain fires the
-        // compact; otherwise the next context event re-plans it. Neither
-        // lastCompactAt nor the hysteresis band is touched on a skip, so
-        // re-planning is not throttled.
-        if (e.compactBusy || e.checkpointBusy) {
-          e.auditor.event("compact_skipped", {
-            reason: e.compactBusy ? "already_in_flight" : "checkpoint_in_flight",
-            pressure: analysis.pressure,
-          });
+      // planned, the checkpoint runs to completion FIRST and the compaction
+      // request is queued from its completion chain. Two further defenses
+      // make this hold across separate context events: the checkpoint LLM
+      // call runs on its own AbortController instead of the shared session
+      // signal (Engine.checkpointAbort), and compaction never fires mid-run —
+      // ctx.compact() begins with abort(), which would kill the in-flight
+      // turn ("Operation aborted"). The request is queued here and fired by
+      // tryFirePendingCompact from agent_end, matching pi's own
+      // auto-compaction timing. If the context overflows before the run
+      // ends, pi's native overflow recovery (compact + retry) handles it.
+      const queueAutoCompact = (): void => {
+        if (!plan.compact || e.compactBusy) return;
+        if (e.compactPending) {
+          // Already queued — refresh the pressure snapshot used for
+          // post-compact effectiveness tracking (§9.1).
+          e.compactPending.pressure = analysis.pressure;
           return;
         }
-        setTransientStatus(ctx, "ctx: compacting…", 0);
-        e.state.lastCompactAt = Date.now();
-        e.state.lastCompactPressureBefore = analysis.pressure;
-        e.state.actionHistory = [
-          ...(e.state.actionHistory ?? []).slice(-19),
-          { action: "compact", timestamp: Date.now(), turn: e.state.turnCount },
-        ];
-        markBandActive(e.state, "compact");
-        persistState(e);
-        const cp = loadLatestCheckpoint(e);
-        e.auditor.event("compact", {
-          triggered: "auto",
-          pressure: analysis.pressure,
-          anchored: cp !== null,
-        });
-
-        e.compactBusy = true;
-        try {
-          ctx.compact({
-            customInstructions: compactInstructions(
-              cp,
-              e.pins.active(),
-              (e.state.consecutiveIneffectiveCompacts ?? 0) >= 1,
-            ),
-            // D1 fix: session_compact handler is the single source of truth.
-            onComplete: () => {
-              e.compactBusy = false;
-              try {
-                e.auditor.event("compact_completed", { triggered: "auto" });
-                setTransientStatus(ctx, "ctx: compacted", 3500);
-              } catch {
-                // fail-open
-              }
-            },
-            onError: (err) => {
-              e.compactBusy = false;
-              setTransientStatus(ctx, "ctx: compact failed", 3500);
-              notify(ctx, `auto compaction failed: ${err.message}`, "error");
-            },
-          });
-        } catch (err) {
-          e.compactBusy = false;
-          setTransientStatus(ctx, "ctx: compact failed", 3500);
-          notify(ctx, `auto compaction could not start: ${String(err)}`, "error");
-        }
+        e.compactPending = { pressure: analysis.pressure };
+        e.auditor.event("compact_queued", { pressure: analysis.pressure });
+        setTransientStatus(ctx, "ctx: compact queued (runs when the turn ends)", 0);
       };
 
       if (plan.checkpoint && !e.checkpointBusy) {
@@ -1084,11 +1120,14 @@ export default function (pi: ExtensionAPI): void {
           // G4: compact only after the checkpoint settles. Pressure relief
           // still wins when the checkpoint failed (runCheckpoint's
           // fail-streak circuit breaker guards repeated failures) - the
-          // compaction just runs unanchored, as before the fix.
-          startAutoCompact();
+          // compaction just runs unanchored, as before the fix. If the run
+          // already ended while the checkpoint was generating, this chain is
+          // the only firing path (agent_end skipped on checkpointBusy).
+          queueAutoCompact();
+          tryFirePendingCompact(ctx);
         });
       } else {
-        startAutoCompact();
+        queueAutoCompact();
       }
 
       if (plan.handoffSuggest && Date.now() - e.lastHandoffSuggestAt > 10 * 60_000) {
@@ -1123,6 +1162,22 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
+  // agent_end = the run is about to go idle (pi awaits these listeners
+  // before settling, and ctx.compact()'s internal waitForIdle then resolves
+  // immediately). This is the safe point to fire a queued auto compact:
+  // abort() is a no-op and no turn is interrupted. agent_end fires on
+  // completed, failed, AND aborted runs (pi-agent-core handleRunFailure).
+  pi.on("agent_end", (_event, ctx) => {
+    const e = engine;
+    if (!e) return;
+    e.agentRunning = false;
+    try {
+      tryFirePendingCompact(ctx);
+    } catch {
+      // fail-open
+    }
+  });
+
   pi.on("turn_end", async (_event, ctx) => {
     const e = engine;
     if (!e || !e.config.enabled) return;
@@ -1154,8 +1209,10 @@ export default function (pi: ExtensionAPI): void {
     const e = engine;
     if (!e) return;
     // Defensive: a successful compaction always clears the in-flight flag,
-    // even if the ctx.compact() onComplete callback was somehow lost.
+    // even if the ctx.compact() onComplete callback was somehow lost. Any
+    // compaction (pi's own included) also satisfies a queued auto request.
     e.compactBusy = false;
+    e.compactPending = null;
     try {
       e.state.compactionCount += 1;
       persistState(e);

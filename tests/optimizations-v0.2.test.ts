@@ -138,10 +138,18 @@ test("T1 (D1): one auto compact increments compactionCount exactly once", async 
     }
     assert.ok((readState().checkpointCount ?? 0) >= 1, "auto checkpoint should complete");
 
-    // Event 2: checkpoint now fresh; pressure ≥ compact.enter → auto compact
+    // Event 2: checkpoint now fresh; pressure ≥ compact.enter → compact queued
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await handlers.get("context")?.({ messages }, ctx as any);
-    assert.equal(compactCalls.length, 1, "auto compact should fire exactly once");
+    assert.equal(
+      compactCalls.length,
+      0,
+      "auto compact must not fire mid-run (its abort() would kill the turn)",
+    );
+    // The run ends → the queued compact fires.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await handlers.get("agent_end")?.({}, ctx as any);
+    assert.equal(compactCalls.length, 1, "auto compact fires exactly once, at run end");
 
     // Pi emits session_compact for extension-triggered compactions too.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -302,7 +310,14 @@ test("T7 (G4 race): auto compact waits for the checkpoint to settle", async () =
         (readState(s.stateFile).checkpointCount ?? 0) >= 1,
         "auto checkpoint should complete first",
       );
-      assert.equal(s.compactCalls.length, 1, "compact fires exactly once, after the checkpoint");
+      assert.equal(
+        s.compactCalls.length,
+        0,
+        "compact stays queued while the run is active, even after the checkpoint settles",
+      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("agent_end")?.({}, s.ctx as any);
+      assert.equal(s.compactCalls.length, 1, "compact fires exactly once, at run end");
       const instructions = s.compactCalls[0]?.customInstructions ?? "";
       assert.ok(
         instructions.includes("never drop the prod table"),
@@ -330,12 +345,19 @@ test("T7 (G4 race): auto compact waits for the checkpoint to settle", async () =
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await s.handlers.get("context")?.({ messages }, s.ctx as any);
 
-      await waitFor(() => s.compactCalls.length === 1);
-      assert.equal(s.compactCalls.length, 1, "failed checkpoint must not block pressure relief");
+      await waitFor(() => readState(s.stateFile).checkpointFailStreak === 1);
       assert.equal(
         readState(s.stateFile).checkpointFailStreak,
         1,
         "checkpoint failure is recorded for the circuit breaker",
+      );
+      assert.equal(s.compactCalls.length, 0, "compact stays queued mid-run");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("agent_end")?.({}, s.ctx as any);
+      assert.equal(
+        s.compactCalls.length,
+        1,
+        "failed checkpoint must not block pressure relief",
       );
       assert.ok(
         typeof s.compactCalls[0]?.customInstructions === "string",
@@ -508,11 +530,17 @@ test("T8 (concurrency): one compact in flight; checkpoint survives session abort
         "checkpoint must complete (not aborted by a concurrent compact)",
       );
       assert.equal(readState(s.stateFile).checkpointFailStreak ?? 0, 0);
-      await waitFor(() => s.compactCalls.length >= 1);
+      assert.equal(
+        s.compactCalls.length,
+        0,
+        "compact stays queued while the run is active (firing would abort the turn)",
+      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("agent_end")?.({}, s.ctx as any);
       assert.equal(
         s.compactCalls.length,
         1,
-        "exactly one compact fires, chained after the checkpoint settles",
+        "exactly one compact fires at run end, anchored by the settled checkpoint",
       );
       assert.ok(
         (s.compactCalls[0]?.customInstructions ?? "").includes("never drop the prod table"),
@@ -563,8 +591,9 @@ test("T8 (concurrency): one compact in flight; checkpoint survives session abort
         capturedSignals[0] && !capturedSignals[0].aborted,
         "the checkpoint's own signal is unaffected by the session abort",
       );
-      // Pressure relief still chains the compact afterwards.
-      await waitFor(() => s.compactCalls.length >= 1);
+      // Pressure relief still fires the compact once the (aborted) run ends.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await s.handlers.get("agent_end")?.({}, s.ctx as any);
       assert.equal(s.compactCalls.length, 1);
     } finally {
       await s.cleanup();
