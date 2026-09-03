@@ -5,17 +5,20 @@ A Pi extension that manages the *effective* context sent to the model:
 
 - **measures** context pressure and quality (`/context`)
 - **prunes** low-value tool output non-destructively (`/context clean`, automatic)
+- **recalls** pruned originals on demand (`/context search`, model tool `context_search`)
 - **checkpoints** task state into a fixed JSON schema (`/context checkpoint`)
 - **drives** Pi's native compaction with checkpoint-anchored instructions (`/context compact`)
 - **hands off** to fresh sessions with a self-contained prompt (`/context handoff`)
 - **pins** critical constraints that survive every destructive step
 
-[中文文档](README.zh-CN.md) · [Design spec (zh)](docs/pi-context-engine.spec.md) · [v0.2 auto-optimization spec (zh)](docs/pi-context-engine.auto-optimization.spec.md)
+[中文文档](README.zh-CN.md) · [Design spec (zh)](docs/pi-context-engine.spec.md) · [v0.2 auto-optimization spec (zh)](docs/pi-context-engine.auto-optimization.spec.md) · [v0.3 recall spec (zh)](docs/pi-context-engine.pi-native-recall.spec.md)
 
 ```
 pi native session (never modified)  ──►  context event  ──►  effective context
                                                         (pruned, folded,
                                                          pins re-injected)
+              ▲
+              └── /context search · context_search tool   (recall L0 originals)
 ```
 
 > Keep the working set, evict the noise, preserve recoverability.
@@ -68,6 +71,7 @@ Env override (tests/CI): `PI_CONTEXT_ENGINE_CONFIG=/path/to/config.json`.
 |---|---|
 | `/context` | Pressure, quality, class breakdown, largest consumers, recommendation |
 | `/context clean` | Manual aggressive pass: stubs stale/duplicates, folds oversized outputs. Applied on the next model call; session file untouched |
+| `/context search <query> [--send]` | Search the session's original tool outputs (including pruned ones). Supports `tool:<name>`, `file:<path>`, `"quoted phrases"`, CJK. `--send` forwards the budgeted results to the model |
 | `/context checkpoint` | LLM-generated, schema-validated task checkpoint (`cp-NNNN.json`) |
 | `/context compact` | Triggers Pi compaction with checkpoint-anchored instructions |
 | `/context handoff` | Checkpoint → self-contained handoff prompt → new session (edit before switching) |
@@ -75,7 +79,12 @@ Env override (tests/CI): `PI_CONTEXT_ENGINE_CONFIG=/path/to/config.json`.
 | `/context pin-last` | Pin the latest user message |
 | `/context pin-file <path>` | Pin a file (its reads are never pruned) |
 | `/context pins` / `/context unpin [id]` | List / remove pins |
-| `/context history` | Audit trail of recent prunes, checkpoints, compactions |
+| `/context history` | Audit trail of recent prunes, checkpoints, compactions, searches |
+
+The model gets the same recall ability natively: the `context_search` tool is
+registered for the LLM (same parser, search, and renderer as the command). It
+only reads the current session branch — never writes, never re-runs commands,
+and results stay within a configurable token budget.
 
 ## Automatic policy
 
@@ -120,6 +129,10 @@ checkpoint counts as fresh only when it is < 10min old AND < 20K tokens AND
   },
   "policy": { "reclaimableMin": 5000, "maxActionsPer10Turns": 3, "adaptiveThresholds": true },
   "checkpoint": { "model": null, "maxPerSession": 20 },
+  "stub": { "enhanced": true, "maxChars": 360, "maxErrorChars": 180, "includeRecoveryRef": true },
+  "search": { "enabled": true, "defaultLimit": 8, "maxLimit": 20, "maxSnippetChars": 800, "maxResultTokens": 3000, "defaultScope": "pruned" },
+  "cacheAware": { "enabled": true },
+  "transientGuidance": { "enabled": true, "minPressure": 0.65, "maxTokens": 120 },
   "prune": { "bands": [
     { "pressureGte": 0.88, "stubMinTokens": 20, "foldMaxChars": 1200 },
     { "pressureGte": 0.80, "stubMinTokens": 30, "foldMaxChars": 1600 },
@@ -145,12 +158,24 @@ Classification is rule-based (no per-message LLM calls):
 - **disposable** — install/fetch/build noise, trivial commands, passing test
   lists, directory listings → stubbed
 
-A stub is a one-line marker (`[pi-context-engine] bash result pruned …`) that
-replaces the large output **in the effective context only**. The original data
-remains in the session file — re-running the command or resuming the session
-always recovers it. Pruning is idempotent (stubbed results are never re-folded)
-and tool results are never deleted, only replaced in place, so provider
-tool-call pairing always holds.
+A stub replaces the large output **in the effective context only**. v0.3 stubs
+are information-dense and deterministic (no LLM calls): they keep the facts that
+matter for continuing the task — exit code, first error signature, test counts,
+read ranges, hit counts, HTTP status — plus a short recovery id:
+
+```
+[pi-context-engine] bash pruned: exit=1, errors=3, first="TS2322: Type 'string' is not assignable to type 'number'", lines=428; ~6.2K tokens; reason=old-output; recover=r:8af1c2
+```
+
+The original data remains untouched in the session file, and the stub's
+`recover=` id resolves back to the exact original via `context_search` /
+`/context search` — no re-run needed. Pruning is idempotent (stubbed results
+are never re-folded), never enlarges (a replacement costing more tokens than
+the original is skipped), and tool results are never deleted, only replaced in
+place, so provider tool-call pairing always holds. When several candidates are
+equally safe, the pruner prefers later positions to shrink the provider prefix
+cache invalidation window (cache locality never overrides safety or a clearly
+larger reclaim).
 
 ## Safety model
 
@@ -158,13 +183,22 @@ tool-call pairing always holds.
   Pi continues with the unmodified context.
 - **Never enlarge**: a replacement that would cost more tokens than the original
   is skipped.
+- **Session-native recovery**: every stub/fold carries a `RecoveryRef`
+  (session id + content hash, no user content) into the session branch;
+  recall searches only the current branch, is read-only, and persists nothing.
+  Pre-compaction originals are searched and flagged when the branch still
+  exposes them; otherwise coverage is reported as partial — never faked.
 - **Pins survive**: pin content is re-injected as a hidden message whenever it is
   missing from the effective context; pinned files force their reads to
   critical.
+- **Transient guidance**: high-pressure hints (use `context_search` before
+  re-running) are injected per-turn into the system prompt only — user
+  constraints, pins, and checkpoints are never transient.
 - **Handoff is suggest-only by default** (`handoff.mode: "suggest"`); the
   explicit `/context handoff` command is the only handoff path.
 - **Audit everything**: every stub/fold is one JSON line in `prune-log.jsonl`
-  with original/replacement sizes and reason.
+  with original/replacement sizes, reason, and recovery ref; searches log
+  query hash + counts only (never raw queries or snippets).
 
 ## Development
 
@@ -184,5 +218,10 @@ Layout follows the spec's recommended source structure (`src/observer`,
   calibrated), enter/exit hysteresis with rate limits, checkpoint backoff /
   circuit breaker / budget, pressure-banded pruning, range-aware read
   supersession
-- v0.3: handoff scoring, automatic fresh-session bootstrap, checkpoint recovery
-- v0.4: semantic folding (embeddings / recall on demand)
+- v0.3 (done): pi-native recall — deterministic enhanced stubs with recovery
+  refs, lexical `context_search` (tool + `/context search`), prefix-cache-aware
+  candidate ordering, transient per-turn guidance
+- v0.3.x: handoff scoring, automatic fresh-session bootstrap, checkpoint recovery
+- v0.4: semantic folding (L2) — only after lexical recall proves out; requires
+  separate LLM budget, per-session caps, circuit breaker, and summarizer
+  validation. See the v0.3 spec §13.3 preconditions.

@@ -25,7 +25,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { loadConfig, resolveThresholds, type ContextEngineConfig } from "./config.ts";
 import { analyzeContext, TokenCalibrator, type ModelInfo } from "./observer/context-observer.ts";
-import { pruneContext, getPruneOptsForPressure } from "./pruning/pruner.ts";
+import { pruneContext, getPruneOptsForPressure, type StubConfig } from "./pruning/pruner.ts";
 import {
   planAutomatic,
   isCheckpointFresh,
@@ -40,9 +40,11 @@ import { buildHandoffPrompt } from "./handoff/handoff.ts";
 import { Auditor, getState, putState } from "./audit.ts";
 import { loadState, saveState, DEFAULT_STATE } from "./state.ts";
 import { renderContextReport, renderCleanReport, fmtK } from "./report.ts";
-import type { AnyMessage, Checkpoint, EngineState, Pin } from "./types.ts";
+import type { AnyMessage, Checkpoint, ContextAnalysis, EngineState, Pin } from "./types.ts";
 import { ENGINE_ID } from "./types.ts";
 import { messageText } from "./observer/token-estimator.ts";
+import { createContextSearchTool, runContextSearch, renderedTokens } from "./recall/tool.ts";
+import { buildTransientGuidance } from "./transient/guidance.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -90,6 +92,13 @@ interface Engine {
    */
   agentRunning: boolean;
   lastHandoffSuggestAt: number;
+  /**
+   * Pressure from the most recent observation (context event / turn_end).
+   * Drives the transient guidance band at before_agent_start (spec §14).
+   */
+  lastPressure: number;
+  /** True once any fold/stub has been applied this session (spec §14.2). */
+  hasFoldedContent: boolean;
 }
 
 function toModelInfo(model: unknown): ModelInfo | null {
@@ -153,6 +162,8 @@ function createEngine(ctx: ExtensionContext): Engine {
     compactPending: null,
     agentRunning: false,
     lastHandoffSuggestAt: 0,
+    lastPressure: 0,
+    hasFoldedContent: false,
   };
 }
 
@@ -596,6 +607,10 @@ async function cmdClean(ctx: ExtensionCommandContext): Promise<void> {
     toolCalls,
     // Manual clean always uses the most aggressive configured band (§8.1).
     opts: getPruneOptsForPressure(before.analysis.pressure, e.config, "manual"),
+    // v0.3 (pi-native-recall §6, §7, §12)
+    sessionId: e.sessionId,
+    stub: stubCfgOf(e),
+    cacheAware: e.config.cacheAware.enabled,
   });
   if (!result.actions.length) {
     notify(ctx, "nothing to clean", "info");
@@ -843,11 +858,112 @@ async function cmdHistory(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// /context search (pi-native-recall spec §11)
+// ---------------------------------------------------------------------------
+
+function stubCfgOf(e: Engine): StubConfig {
+  return {
+    enhanced: e.config.stub.enhanced,
+    maxChars: e.config.stub.maxChars,
+    maxErrorChars: e.config.stub.maxErrorChars,
+    includeRecoveryRef: e.config.stub.includeRecoveryRef,
+  };
+}
+
+/**
+ * v0.3 §12.1: an auto prune only needs to reclaim enough to exit the prune
+ * band (plus a small buffer for meter drift). Combined with cache-aware
+ * ordering this applies the minimal set of candidates — the observable
+ * behavior behind acceptance Case R3. Manual clean always applies everything.
+ */
+function autoPruneTarget(e: Engine, analysis: ContextAnalysis, model: ModelInfo | null): number {
+  try {
+    const t = resolveThresholds(e.config, model);
+    const exit = t.prune.exit;
+    if (!(analysis.pressure > exit) || !(analysis.pressure > 0)) return 0;
+    const capacity = analysis.totalTokens / analysis.pressure; // implied window
+    if (!Number.isFinite(capacity) || capacity <= 0) return 0;
+    return Math.ceil((analysis.pressure - exit) * capacity) + 512;
+  } catch {
+    return 0; // fail-open: apply all planned candidates
+  }
+}
+
+async function cmdSearch(ctx: ExtensionCommandContext, rest: string): Promise<void> {
+  const e = engine;
+  if (!e) return notify(ctx, "context engine not initialized", "warning");
+  if (!e.config.search.enabled) {
+    return notify(ctx, "context search is disabled (search.enabled=false)", "warning");
+  }
+  let q = rest.trim();
+  let send = false;
+  if (/(^|\s)--send\s*$/.test(q)) {
+    send = true;
+    q = q.replace(/(^|\s)--send\s*$/, "").trim();
+  }
+  if (!q) {
+    return notify(
+      ctx,
+      'usage: /context search <query> [--send]  ·  e.g. /context search tool:bash "error TS2322"',
+      "error",
+    );
+  }
+  const run = await runContextSearch(e, ctx.sessionManager, { query: q }, undefined);
+  if (!run.ok) return notify(ctx, run.error, "error");
+  await showPanel(ctx, "Context search", run.rendered.text);
+
+  if (send) {
+    try {
+      piApi?.sendMessage(
+        {
+          customType: `${ENGINE_ID}:search`,
+          content: run.rendered.text,
+          display: true,
+          details: run.rendered.details,
+        },
+        { triggerTurn: true, deliverAs: ctx.isIdle() ? "nextTurn" : "steer" },
+      );
+      e.auditor.event("context_search_sent", {
+        hits: run.rendered.details.hits,
+        tokens: renderedTokens(run.rendered),
+      });
+      notify(ctx, "search results sent to the model (budgeted & redacted)", "info");
+    } catch (err) {
+      notify(ctx, `failed to send search results: ${String(err)}`, "error");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extension factory
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
   piApi = pi;
+
+  // Model self-service recall (pi-native-recall spec §10). Registration is
+  // global; the per-session engine (and its search.enabled flag) is resolved
+  // at execution time. When the boot config disables search entirely, the
+  // tool is not registered at all (spec §15).
+  let searchEnabledAtBoot = true;
+  try {
+    searchEnabledAtBoot = loadConfig().search.enabled;
+  } catch {
+    // fall back to default (enabled)
+  }
+  if (searchEnabledAtBoot) {
+    try {
+      pi.registerTool(
+        createContextSearchTool(() => engine),
+      );
+    } catch (err) {
+      try {
+        console.error(`[${ENGINE_ID}] context_search registration failed:`, String(err));
+      } catch {
+        // fail-open
+      }
+    }
+  }
 
   pi.on("session_start", (_event, ctx) => {
     try {
@@ -989,6 +1105,7 @@ export default function (pi: ExtensionAPI): void {
         !plan.compact &&
         !plan.handoffSuggest
       ) {
+        e.lastPressure = analysis.pressure; // transient guidance band (§14)
         return; // fast path — no action needed
       }
 
@@ -1004,10 +1121,16 @@ export default function (pi: ExtensionAPI): void {
           analysis,
           toolCalls: classify.toolCalls,
           opts: pruneOpts,
+          // v0.3 (pi-native-recall §6, §7, §12)
+          sessionId: e.sessionId,
+          stub: stubCfgOf(e),
+          cacheAware: e.config.cacheAware.enabled,
+          targetReclaimable: armed ? 0 : autoPruneTarget(e, analysis, model),
         });
 
         if (result.actions.length) {
           messages = result.context;
+          e.hasFoldedContent = true; // transient guidance flag (§14.2)
           e.state.lastPruneAt = Date.now();
           e.state.actionHistory = [
             ...(e.state.actionHistory ?? []).slice(-19),
@@ -1153,6 +1276,8 @@ export default function (pi: ExtensionAPI): void {
         }
       }
 
+      e.lastPressure = analysis.pressure; // transient guidance band (§14)
+
       if (messages !== (event.messages as AnyMessage[])) {
         return { messages: messages as unknown as AgentMessage[] };
       }
@@ -1178,6 +1303,46 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
+  // Transient per-turn system-prompt guidance (pi-native-recall spec §14).
+  // The text is byte-stable per (band, hasFolded, compactImminent) template
+  // and is NEVER persisted — it is re-derived from in-memory engine state
+  // every turn and disappears on session switch/shutdown.
+  pi.on("before_agent_start", (event, ctx) => {
+    const e = engine;
+    if (!e || !e.config.enabled) return;
+    try {
+      const model = toModelInfo(ctx.model);
+      const thresholds = resolveThresholds(e.config, model);
+      const compactEnter = thresholds.compact.enter + (e.state.adaptiveCompactEnterDelta ?? 0);
+      const guidance = buildTransientGuidance(
+        {
+          pressure: e.lastPressure,
+          hasFolded: e.hasFoldedContent,
+          compactImminent: e.compactPending !== null || e.lastPressure >= compactEnter,
+        },
+        {
+          enabled: e.config.transientGuidance.enabled,
+          minPressure: e.config.transientGuidance.minPressure,
+          maxTokens: e.config.transientGuidance.maxTokens,
+          compactEnter,
+        },
+      );
+      if (!guidance) return;
+      e.auditor.event("transient_guidance", {
+        template: guidance.templateId,
+        band: guidance.band,
+      });
+      return { systemPrompt: `${event.systemPrompt}\n\n${guidance.text}` };
+    } catch (err) {
+      // fail-open: no injection, the agent runs normally (spec §18)
+      try {
+        e.auditor.event("error", { where: "before_agent_start", error: String(err) });
+      } catch {
+        // fail-open
+      }
+    }
+  });
+
   pi.on("turn_end", async (_event, ctx) => {
     const e = engine;
     if (!e || !e.config.enabled) return;
@@ -1190,6 +1355,9 @@ export default function (pi: ExtensionAPI): void {
           compactions: e.state.compactionCount,
           checkpoints: e.state.checkpointCount,
         });
+      }
+      if (typeof usage?.percent === "number") {
+        e.lastPressure = usage.percent / 100; // transient guidance band (§14)
       }
       if (!transientStatusTimer && ctx.hasUI && usage?.percent != null) {
         const model = toModelInfo(ctx.model);
@@ -1213,6 +1381,7 @@ export default function (pi: ExtensionAPI): void {
     // compaction (pi's own included) also satisfies a queued auto request.
     e.compactBusy = false;
     e.compactPending = null;
+    e.hasFoldedContent = false; // context rebuilt; stubs gone (§14.2)
     try {
       e.state.compactionCount += 1;
       persistState(e);
@@ -1224,13 +1393,14 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerCommand("context", {
     description:
-      "Context engine: /context [status|clean|checkpoint|compact|handoff|pin|pins|unpin|history]",
+      "Context engine: /context [status|clean|search|checkpoint|compact|handoff|pin|pins|unpin|history]",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const sub = (prefix ?? "").split(" ")[0].toLowerCase();
       const items: AutocompleteItem[] = [
         "",
         "status",
         "clean",
+        "search ",
         "checkpoint",
         "compact",
         "handoff",
@@ -1260,6 +1430,9 @@ export default function (pi: ExtensionAPI): void {
             break;
           case "clean":
             await cmdClean(ctx);
+            break;
+          case "search":
+            await cmdSearch(ctx, rest);
             break;
           case "checkpoint":
             await cmdCheckpoint(ctx);
@@ -1291,7 +1464,7 @@ export default function (pi: ExtensionAPI): void {
           default:
             notify(
               ctx,
-              `unknown subcommand "${sub}" — use: status | clean | checkpoint | compact | handoff | pin | pins | unpin | history`,
+              `unknown subcommand "${sub}" — use: status | clean | search | checkpoint | compact | handoff | pin | pins | unpin | history`,
               "error",
             );
         }

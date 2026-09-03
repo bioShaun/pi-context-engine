@@ -144,6 +144,23 @@ export interface PruneAction {
   tags?: string[];
   /** For folds: the folded replacement text (for audit/UI). */
   preview?: string;
+  // v0.3 (pi-native-recall spec §6.3, §12.4)
+  /** L1 fold / L3 stub (§13). Missing on old actions → treated as 1. */
+  level?: 1 | 2 | 3;
+  /** Stable recovery reference into the Pi session branch (absent → §6.4 failure path). */
+  recovery?: RecoveryRef;
+  /** Why no RecoveryRef could be built ("no-session-id" | "empty-content" | ...). */
+  recoveryUnavailable?: string;
+  /** Enhanced-stub fact field names present (spec §7, §16 stub_enhanced). */
+  stubFacts?: string[];
+  /** toolCallId of the pruned message (stable, for search association). */
+  toolCallId?: string;
+  /** originalTokens - replacementTokens. */
+  reclaimableTokens?: number;
+  /** 0..1, later branch position = higher (prefix-cache locality, §12). */
+  cacheLocality?: number;
+  /** 1-based rank in the ordered candidate list actually applied (§12.4). */
+  selectedRank?: number;
 }
 
 export interface PruneResult {
@@ -310,4 +327,78 @@ export interface AuditEvent {
   time: string;
   action: string;
   [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Recall (pi-native-recall spec §6, §7, §8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stable reference from a fold/stub back to the L0 original in the Pi
+ * session branch. Resolution priority (§6.2): branchEntryId →
+ * toolCallId+contentHash → messageTimestamp+contentHash → contentHash (unique).
+ */
+export interface RecoveryRef {
+  version: 1;
+  sessionId: string;
+  branchEntryId?: string;
+  toolCallId?: string;
+  messageTimestamp?: number;
+  /** Deterministic hash of the full original text (location/disambig only, not auth). */
+  contentHash: string;
+}
+
+/**
+ * Machine-extracted stub facts (spec §7.1). Every field must come from the
+ * message structure, tool arguments, or deterministic text matching.
+ */
+export interface StubFacts {
+  status?: "success" | "failure" | "cancelled" | "unknown";
+  exitCode?: number | null;
+  errorCount?: number;
+  warningCount?: number;
+  resultCount?: number;
+  lineCount?: number;
+  byteCount?: number;
+  path?: string;
+  range?: { start?: number; end?: number };
+  command?: string;
+  /** grep/find search pattern (short). */
+  pattern?: string;
+  /** fetch/network: high-confidence HTTP status (§7.2). */
+  httpStatus?: number;
+  /** fetch/network: response content type (§7.2). */
+  contentType?: string;
+  errorSignature?: string;
+  recoveryId?: string;
+  /** grep/find: distinct file count when determinable (spec §7.2). */
+  fileCount?: number;
+  /** output was truncated upstream (spec §7.2 grep/find/ls). */
+  truncated?: boolean;
+}
+
+/**
+ * One searchable unit: an L0 original tool output in the current branch
+ * (spec §8.1). Prune metadata links it back to its engine stub/fold.
+ */
+export interface SearchDocument {
+  recovery: RecoveryRef;
+  entryId?: string;
+  toolCallId?: string;
+  tool: string;
+  /** bash command text (bashExecution or bash tool call). */
+  command?: string;
+  /** JSON of the assistant tool-call arguments (for path/pattern filters). */
+  argsText?: string;
+  /** Full original text (L0). Never copied anywhere else. */
+  content: string;
+  timestamp: number;
+  estimatedTokens: number;
+  /** true when the entry predates the latest compaction on this branch. */
+  preCompaction?: boolean;
+  prune?: {
+    kind: "stub" | "fold";
+    reason: string;
+    at: string;
+  };
 }

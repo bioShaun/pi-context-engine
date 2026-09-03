@@ -50,6 +50,36 @@ export interface ContextEngineConfig {
   };
   /** Pressure band labels for reports (spec §9). */
   pressure: { green: number; yellow: number; orange: number; red: number };
+  // v0.3 (pi-native-recall spec §15)
+  /** Enhanced deterministic stubs (§7). */
+  stub: {
+    enhanced: boolean;
+    /** hard cap on stub length in chars (≤ 1000). */
+    maxChars: number;
+    /** max chars for the errorSignature field. */
+    maxErrorChars: number;
+    /** include recover=<id> in stub text. */
+    includeRecoveryRef: boolean;
+  };
+  /** context_search tool + /context search (§9–11). */
+  search: {
+    enabled: boolean;
+    defaultLimit: number;
+    /** hard cap on result count (≤ 50). */
+    maxLimit: number;
+    maxSnippetChars: number;
+    /** total token budget for one tool/command result (≤ 8000). */
+    maxResultTokens: number;
+    defaultScope: "pruned" | "all";
+  };
+  /** Prefix-cache-aware candidate ordering (§12). */
+  cacheAware: { enabled: boolean };
+  /** Transient per-turn system-prompt guidance (§14). */
+  transientGuidance: {
+    enabled: boolean;
+    minPressure: number;
+    maxTokens: number;
+  };
   limits: {
     /** tool results at/above this many estimated tokens are "oversized". */
     oversizedTokens: number;
@@ -117,6 +147,17 @@ export const DEFAULT_CONFIG: ContextEngineConfig = {
     ],
   },
   pressure: { green: 0.55, yellow: 0.7, orange: 0.82, red: 0.9 },
+  stub: { enhanced: true, maxChars: 360, maxErrorChars: 180, includeRecoveryRef: true },
+  search: {
+    enabled: true,
+    defaultLimit: 8,
+    maxLimit: 20,
+    maxSnippetChars: 800,
+    maxResultTokens: 3000,
+    defaultScope: "pruned",
+  },
+  cacheAware: { enabled: true },
+  transientGuidance: { enabled: true, minPressure: 0.65, maxTokens: 120 },
   limits: { oversizedTokens: 1000, recentWindow: 8, stubMinTokens: 50, foldMaxChars: 2200 },
   reserves: { output: 8192, safety: 4096, system: 4000 },
   cooldowns: { pruneMs: 15_000, compactMs: 300_000, checkpointFreshMs: 600_000 },
@@ -287,6 +328,57 @@ export function sanitizeAndMigrateConfig(rawConfig: unknown): { config: ContextE
     events.push({ action: "config_sanitized", field: "prune.bands", fallback: DEFAULT_CONFIG.prune.bands });
     merged.prune = { ...merged.prune, bands: [...DEFAULT_CONFIG.prune.bands] };
   }
+
+  // v0.3: stub / search / cacheAware / transientGuidance sanitization (§15)
+  const d = DEFAULT_CONFIG;
+  const sanitizeBool = (field: string, v: unknown, fallback: boolean) => {
+    if (typeof v !== "boolean") {
+      events.push({ action: "config_sanitized", field, fallback });
+      return fallback;
+    }
+    return v;
+  };
+  const sanitizeNum = (field: string, v: unknown, min: number, max: number, fallback: number) => {
+    if (typeof v !== "number" || Number.isNaN(v) || v < min || v > max) {
+      events.push({ action: "config_sanitized", field, fallback });
+      return fallback;
+    }
+    return Math.floor(v);
+  };
+
+  merged.stub = {
+    enhanced: sanitizeBool("stub.enhanced", merged.stub?.enhanced, d.stub.enhanced),
+    maxChars: sanitizeNum("stub.maxChars", merged.stub?.maxChars, 40, 1000, d.stub.maxChars),
+    maxErrorChars: sanitizeNum("stub.maxErrorChars", merged.stub?.maxErrorChars, 20, 1000, d.stub.maxErrorChars),
+    includeRecoveryRef: sanitizeBool("stub.includeRecoveryRef", merged.stub?.includeRecoveryRef, d.stub.includeRecoveryRef),
+  };
+  if (merged.stub.maxErrorChars > merged.stub.maxChars) {
+    events.push({ action: "config_sanitized", field: "stub.maxErrorChars", fallback: merged.stub.maxChars });
+    merged.stub = { ...merged.stub, maxErrorChars: merged.stub.maxChars };
+  }
+
+  merged.search = {
+    enabled: sanitizeBool("search.enabled", merged.search?.enabled, d.search.enabled),
+    defaultLimit: sanitizeNum("search.defaultLimit", merged.search?.defaultLimit, 1, 50, d.search.defaultLimit),
+    maxLimit: sanitizeNum("search.maxLimit", merged.search?.maxLimit, 1, 50, d.search.maxLimit),
+    maxSnippetChars: sanitizeNum("search.maxSnippetChars", merged.search?.maxSnippetChars, 50, 2000, d.search.maxSnippetChars),
+    maxResultTokens: sanitizeNum("search.maxResultTokens", merged.search?.maxResultTokens, 100, 8000, d.search.maxResultTokens),
+    defaultScope: merged.search?.defaultScope === "all" ? "all" : merged.search?.defaultScope === "pruned" ? "pruned" : (events.push({ action: "config_sanitized", field: "search.defaultScope", fallback: d.search.defaultScope }), d.search.defaultScope),
+  };
+  if (merged.search.defaultLimit > merged.search.maxLimit) {
+    events.push({ action: "config_sanitized", field: "search.defaultLimit", fallback: merged.search.maxLimit });
+    merged.search = { ...merged.search, defaultLimit: merged.search.maxLimit };
+  }
+
+  merged.cacheAware = {
+    enabled: sanitizeBool("cacheAware.enabled", merged.cacheAware?.enabled, d.cacheAware.enabled),
+  };
+
+  merged.transientGuidance = {
+    enabled: sanitizeBool("transientGuidance.enabled", merged.transientGuidance?.enabled, d.transientGuidance.enabled),
+    minPressure: sanitizeNum("transientGuidance.minPressure", merged.transientGuidance?.minPressure, 0, 2, d.transientGuidance.minPressure),
+    maxTokens: sanitizeNum("transientGuidance.maxTokens", merged.transientGuidance?.maxTokens, 20, 400, d.transientGuidance.maxTokens),
+  };
 
   // Precompile models
   merged._compiledModels = compileModelRules(merged.models ?? {});
