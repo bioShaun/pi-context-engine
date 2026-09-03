@@ -70,6 +70,7 @@ Env override (tests/CI): `PI_CONTEXT_ENGINE_CONFIG=/path/to/config.json`.
 | Command | Effect |
 |---|---|
 | `/context` | Pressure, quality, class breakdown, largest consumers, recommendation |
+| `/context enable` / `/context disable` | Turn the engine's auto pipeline on/off **for this session only** (in-memory; config file untouched, resets on new session/restart). Disabling cancels a queued auto compact; each actual switch is audited |
 | `/context clean` | Manual aggressive pass: stubs stale/duplicates, folds oversized outputs. Applied on the next model call; session file untouched |
 | `/context search <query> [--send]` | Search the session's original tool outputs (including pruned ones). Supports `tool:<name>`, `file:<path>`, `"quoted phrases"`, CJK. `--send` forwards the budgeted results to the model |
 | `/context checkpoint` | LLM-generated, schema-validated task checkpoint (`cp-NNNN.json`) |

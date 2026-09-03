@@ -507,6 +507,54 @@ function clearTransientStatus(
 // Command handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * Session-local toggle (instant enable/disable).
+ *
+ * Only mutates the in-memory engine.config.enabled — never any config file.
+ * A new session (or restart) reloads `enabled` from the config cascade, so
+ * the toggle is intentionally ephemeral.
+ *
+ * disable(): besides flipping the flag it cancels a queued auto compact
+ * (compactPending) and clears transient state, so nothing the pipeline had
+ * staged fires after the switch. The enabled guards in the context /
+ * before_agent_start / turn_end handlers already skip everything else.
+ * The auto-compact re-queue inside an in-flight checkpoint chain is also
+ * gated on enabled (see queueAutoCompact), so a checkpoint completing after
+ * disable cannot resurrect the queued compact.
+ */
+async function cmdEnable(ctx: ExtensionCommandContext): Promise<void> {
+  const e = engine;
+  if (!e) return notify(ctx, "context engine not initialized", "warning");
+  if (e.config.enabled) {
+    notify(ctx, "context engine already enabled (this session)", "info");
+    return;
+  }
+  e.config.enabled = true;
+  e.auditor.event("engine_toggled", { enabled: true, reason: "manual" });
+  notify(ctx, "context engine enabled (this session; config file unchanged)", "info");
+}
+
+async function cmdDisable(ctx: ExtensionCommandContext): Promise<void> {
+  const e = engine;
+  if (!e) return notify(ctx, "context engine not initialized", "warning");
+  if (!e.config.enabled) {
+    notify(ctx, "context engine already disabled (this session)", "info");
+    return;
+  }
+  e.config.enabled = false;
+  e.compactPending = null; // cancel a queued auto compact
+  e.cleanArmed = { until: 0 }; // drop a pending manual clean as well
+  e.lastPressure = 0; // transient guidance band input
+  e.hasFoldedContent = false; // transient guidance flag (§14.2)
+  clearTransientStatus(ctx);
+  e.auditor.event("engine_toggled", { enabled: false, reason: "manual" });
+  notify(
+    ctx,
+    "context engine disabled (this session; auto pipeline off; config file unchanged)",
+    "info",
+  );
+}
+
 async function cmdStatus(ctx: ExtensionCommandContext): Promise<void> {
   const e = engine;
   if (!e) {
@@ -535,17 +583,20 @@ async function cmdStatus(ctx: ExtensionCommandContext): Promise<void> {
     },
     e.state,
   ).decision;
+  const stateLine = e.config.enabled
+    ? "State: ENABLED — auto pipeline active this session"
+    : "State: DISABLED — auto pipeline off this session (/context enable to resume)";
   await showPanel(
     ctx,
     "Context Engine",
-    renderContextReport({
+    `${stateLine}\n\n${renderContextReport({
       analysis,
       model,
       pins: e.pins.all(),
       compactions: e.state.compactionCount,
       decision,
       checkpointFresh: !!cp,
-    }),
+    })}`,
   );
 }
 
@@ -1213,7 +1264,9 @@ export default function (pi: ExtensionAPI): void {
       // auto-compaction timing. If the context overflows before the run
       // ends, pi's native overflow recovery (compact + retry) handles it.
       const queueAutoCompact = (): void => {
-        if (!plan.compact || e.compactBusy) return;
+        // Session-local disable must win even over an in-flight checkpoint
+        // completion chain: never re-queue a compact after the toggle.
+        if (!e.config.enabled || !plan.compact || e.compactBusy) return;
         if (e.compactPending) {
           // Already queued — refresh the pressure snapshot used for
           // post-compact effectiveness tracking (§9.1).
@@ -1234,6 +1287,12 @@ export default function (pi: ExtensionAPI): void {
         markBandActive(e.state, "checkpoint");
         persistState(e);
         void runCheckpoint(e, ctx, messages, "auto").then((r) => {
+          // Session-local disable may land while the checkpoint LLM call is
+          // in flight. runCheckpoint has already persisted and audited the
+          // result by now; everything after this point is post-completion
+          // pipeline behavior (transient status, notification, compact
+          // queue/fire) and must not surface after the switch.
+          if (!e.config.enabled) return;
           setTransientStatus(ctx, r.ok ? "ctx: cp saved" : "ctx: cp failed", 3000);
           notify(
             ctx,
@@ -1393,12 +1452,14 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerCommand("context", {
     description:
-      "Context engine: /context [status|clean|search|checkpoint|compact|handoff|pin|pins|unpin|history]",
+      "Context engine: /context [status|enable|disable|clean|search|checkpoint|compact|handoff|pin|pins|unpin|history]",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const sub = (prefix ?? "").split(" ")[0].toLowerCase();
       const items: AutocompleteItem[] = [
         "",
         "status",
+        "enable",
+        "disable",
         "clean",
         "search ",
         "checkpoint",
@@ -1427,6 +1488,12 @@ export default function (pi: ExtensionAPI): void {
           case "":
           case "status":
             await cmdStatus(ctx);
+            break;
+          case "enable":
+            await cmdEnable(ctx);
+            break;
+          case "disable":
+            await cmdDisable(ctx);
             break;
           case "clean":
             await cmdClean(ctx);
@@ -1464,7 +1531,7 @@ export default function (pi: ExtensionAPI): void {
           default:
             notify(
               ctx,
-              `unknown subcommand "${sub}" — use: status | clean | search | checkpoint | compact | handoff | pin | pins | unpin | history`,
+              `unknown subcommand "${sub}" — use: status | enable | disable | clean | search | checkpoint | compact | handoff | pin | pins | unpin | history`,
               "error",
             );
         }

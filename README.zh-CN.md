@@ -69,6 +69,7 @@ peer 依赖，由 Pi 本身提供——扩展没有自己的运行时依赖）�
 | 命令 | 作用 |
 |---|---|
 | `/context` | 压力、质量、分类占比、最大占用项、建议动作 |
+| `/context enable` / `/context disable` | 仅对**当前会话**启停引擎自动管线（内存态；不改配置文件，新会话/重启后按配置恢复）。disable 会取消已排队的自动 compact；每次实际切换写入审计事件 |
 | `/context clean` | 手动激进清理：stale/重复项打桩（stub），超大输出折叠。下一次模型调用时生效；会话文件不动 |
 | `/context search <query> [--send]` | 检索会话中的原始工具输出（含已裁剪内容）。支持 `tool:<name>`、`file:<path>`、`"精确短语"`、中文。`--send` 把预算内的结果发给模型 |
 | `/context checkpoint` | LLM 生成、schema 校验的任务 checkpoint（`cp-NNNN.json`） |
